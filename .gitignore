@@ -1,0 +1,18 @@
+# 构建产物
+bin/
+*.exe
+
+# 环境与密钥（切勿提交）
+.env
+certs/
+.dev/
+
+# Go
+vendor/
+
+# 日志
+*.log
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,105 @@
+# ============================================================================
+# docker-compose：Redis(缓存) + MySQL(日志) + dnsd + apid + 前端
+# 用法：
+#   cp .env.example .env   # 修改密钥与证书路径
+#   docker compose up -d
+# ============================================================================
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [dnsnet]
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root}
+      MYSQL_DATABASE: dns_platform
+      MYSQL_USER: dns
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-dns_pass}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=500
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-change_me_root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [dnsnet]
+
+  dnsd:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.dnsd
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_ADDR: redis:6379
+      MYSQL_DSN: dns:${MYSQL_PASSWORD:-dns_pass}@tcp(mysql:3306)/dns_platform?parseTime=true&charset=utf8mb4
+      DNS_LISTEN_UDP: :53
+      DNS_LISTEN_TCP: :53
+      DOT_LISTEN: :853
+      DOH_LISTEN: :8443
+      DOQ_LISTEN: :784
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "853:853/tcp"
+      - "8443:8443/tcp"
+      - "784:784/udp"
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+    networks: [dnsnet]
+
+  apid:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.apid
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_ADDR: redis:6379
+      MYSQL_DSN: dns:${MYSQL_PASSWORD:-dns_pass}@tcp(mysql:3306)/dns_platform?parseTime=true&charset=utf8mb4
+      API_LISTEN: :8080
+      API_ADMIN_LISTEN: :8443
+    ports:
+      - "8080:8080/tcp"
+      - "8443:8443/tcp"
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+    networks: [dnsnet]
+
+  frontend:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./deploy/nginx-frontend.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8081:80/tcp"
+    depends_on: [apid]
+    networks: [dnsnet]
+
+volumes:
+  redis-data:
+  mysql-data:
+
+networks:
+  dnsnet:
+    driver: bridge

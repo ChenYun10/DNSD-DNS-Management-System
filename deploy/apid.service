@@ -1,0 +1,25 @@
+# DNS 控制面 systemd 单元（Linux）
+# REST API :8080（客户）+ :8443（管理通道，可选 mTLS）
+[Unit]
+Description=dns-platform control plane (REST API)
+Documentation=https://github.com/openclaw/dns-platform
+After=network-online.target redis-server.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dns
+Group=dns
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/dns-platform
+ExecStart=/usr/local/bin/apid -env /etc/dns-platform/.env
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
