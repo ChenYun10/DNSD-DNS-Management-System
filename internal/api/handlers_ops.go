@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 
 	"dns-platform/internal/model"
@@ -61,6 +63,27 @@ func (a *API) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// rejectInternalUpstream blocks upstream addresses that point at internal
+// or cloud-metadata networks (SSRF guard). Hostnames are allowed (they are
+// resolved by the platform at runtime), IP literals are validated.
+func rejectInternalUpstream(u *model.Upstream) error {
+	ip := net.ParseIP(u.Address)
+	if ip == nil {
+		// not an IP literal ? allow (hostname)
+		return nil
+	}
+	// Alibaba / AWS / GCP metadata endpoints
+	for _, m := range []string{"100.100.100.200", "169.254.169.254"} {
+		if u.Address == m {
+			return errors.New("upstream address targets metadata service (blocked)")
+		}
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return errors.New("upstream address must be a public IP (blocked internal address)")
+	}
+	return nil
+}
+
 func (a *API) createUpstream(w http.ResponseWriter, r *http.Request) {
 	var u model.Upstream
 	if err := readJSON(w, r, &u); err != nil {
@@ -69,6 +92,10 @@ func (a *API) createUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.Protocol == "" || u.Address == "" || u.GroupID == "" {
 		writeErr(w, http.StatusBadRequest, "protocol, address and group_id required")
+		return
+	}
+	if err := rejectInternalUpstream(&u); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if u.TLSInsecure && a.cfg.Env == "prod" {
@@ -90,6 +117,10 @@ func (a *API) updateUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.ID = r.PathValue("id")
+	if err := rejectInternalUpstream(&u); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if u.TLSInsecure && a.cfg.Env == "prod" {
 		writeErr(w, http.StatusBadRequest, "tls_insecure is forbidden in prod")
 		return
