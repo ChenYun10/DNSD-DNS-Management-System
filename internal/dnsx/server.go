@@ -217,6 +217,7 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 // readDNSMessageCompat reads one DNS message, auto-detecting the framing:
 //   - "raw"      RFC 7858: message bytes directly on the stream
 //   - "prefixed" RFC 1035 TCP style: 2-byte big-endian length + message
+//
 // A length prefix is assumed only when the first two bytes form a plausible
 // length AND the prefixed payload unpacks cleanly; otherwise the bytes are
 // re-interpreted as the start of a raw message.

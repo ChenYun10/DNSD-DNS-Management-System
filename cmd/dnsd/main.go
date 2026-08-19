@@ -94,16 +94,16 @@ func main() {
 				errTotal = float64(te) / float64(tq) * 100.0
 			}
 			payload, err := json.Marshal(map[string]any{
-				"instance_id":           cfg.InstanceID,
-				"qps":                   qps,
-				"hit_rate_pct":          hitRate,
-				"error_rate_pct":        errRate,
-				"hit_rate_total_pct":    hitTotal,
-				"error_rate_total_pct":  errTotal,
-				"total_queries":         tq,
-				"total_hits":            th,
-				"total_errors":          te,
-				"ts":                    time.Now().Unix(),
+				"instance_id":          cfg.InstanceID,
+				"qps":                  qps,
+				"hit_rate_pct":         hitRate,
+				"error_rate_pct":       errRate,
+				"hit_rate_total_pct":   hitTotal,
+				"error_rate_total_pct": errTotal,
+				"total_queries":        tq,
+				"total_hits":           th,
+				"total_errors":         te,
+				"ts":                   time.Now().Unix(),
 			})
 			if err != nil {
 				continue
