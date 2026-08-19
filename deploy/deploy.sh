@@ -90,6 +90,11 @@ BT=$(openssl rand -hex 16)
 RPW=$(openssl rand -hex 16)
 MYSQLP=$(openssl rand -hex 12)
 sed -i "s|^BASE_DOMAIN=.*|BASE_DOMAIN=${DOMAIN}|" /etc/dns-platform/.env
+sed -i 's|^DOT_LISTEN=.*|DOT_LISTEN=:853|' /etc/dns-platform/.env
+sed -i 's|^DOH_LISTEN=.*|DOH_LISTEN=:443|' /etc/dns-platform/.env
+sed -i 's|^DOQ_LISTEN=.*|DOQ_LISTEN=:853|' /etc/dns-platform/.env
+sed -i 's|^API_LISTEN=.*|API_LISTEN=127.0.0.1:8080|' /etc/dns-platform/.env
+sed -i 's|^API_ADMIN_LISTEN=.*|API_ADMIN_LISTEN=127.0.0.1:8443|' /etc/dns-platform/.env
 sed -i "s|^API_JWT_SECRET=.*|API_JWT_SECRET=${JWT}|" /etc/dns-platform/.env
 sed -i "s|^BOOTSTRAP_TOKEN=.*|BOOTSTRAP_TOKEN=${BT}|" /etc/dns-platform/.env
 sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${RPW}|" /etc/dns-platform/.env
