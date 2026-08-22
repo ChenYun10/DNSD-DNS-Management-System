@@ -54,7 +54,7 @@
 ```bash
 sudo bash deploy/deploy.sh \
   -d dns.example.com \
-  -e admin@dns.example.com \
+  -e admin@example.com \
   -k <阿里云 AccessKey ID> \
   -s <阿里云 AccessKey Secret> \
   -p '你的初始密码'
