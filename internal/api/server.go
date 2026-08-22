@@ -24,6 +24,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"dns-platform/internal/certmgr"
 	"dns-platform/internal/config"
 	"dns-platform/internal/dnsx"
 	"dns-platform/internal/store"
@@ -38,10 +39,11 @@ type API struct {
 	rdb     *redis.Client
 	limiter *dnsx.Limiter
 	auth    *Auth
+	certs   *certmgr.Manager
 }
 
-func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client) *API {
-	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb}
+func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client, certs *certmgr.Manager) *API {
+	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb, certs: certs}
 	a.limiter = dnsx.NewLimiter(rdb, cfg.RateLimitQPS, cfg.RateLimitVIPMult)
 	a.auth = NewAuth(cfg, repos, mysql, rdb, a.limiter)
 	return a
@@ -73,6 +75,13 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/tenants/{id}/endpoints", a.chain(a.tenantEndpoints, a.auth.authMiddleware, a.scopeTenant)) // DoT/DoH/DoQ 部署端点
 	mux.HandleFunc("POST /api/v1/tenants/{id}/warm", a.chain(a.warmTenant, a.auth.authMiddleware, a.scopeTenant))          // ECS 动态预热
 	mux.HandleFunc("GET /api/v1/tenants/{id}/stats", a.chain(a.tenantStats, a.auth.authMiddleware, a.scopeTenant))
+
+	// tenant custom main domains + admin-managed SSL (客户自定义主域名 / 后台做SSL)
+	mux.HandleFunc("GET /api/v1/domains", a.chain(a.listDomains, a.auth.authMiddleware))
+	mux.HandleFunc("POST /api/v1/domains", a.chain(a.createDomain, a.auth.authMiddleware, requireAdmin))
+	mux.HandleFunc("DELETE /api/v1/domains/{id}", a.chain(a.deleteDomain, a.auth.authMiddleware, requireAdmin))
+	mux.HandleFunc("POST /api/v1/domains/{id}/issue", a.chain(a.issueDomainCert, a.auth.authMiddleware, requireAdmin))
+	mux.HandleFunc("GET /api/v1/certs", a.chain(a.certsOverview, a.auth.authMiddleware, requireAdmin))
 
 	// users (admin)
 	mux.HandleFunc("GET /api/v1/users", a.chain(a.listUsers, a.auth.authMiddleware, requireAdmin))

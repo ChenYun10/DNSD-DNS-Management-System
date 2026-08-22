@@ -63,7 +63,7 @@ func (a *API) cachePurge(w http.ResponseWriter, r *http.Request) {
 			prefix += ":" + store.Safe(in.QName)
 		}
 	}
-	n, err := a.core.CacheDriver().Purge(r.Context(), prefix)
+	n, err := a.core.PurgeCache(r.Context(), prefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

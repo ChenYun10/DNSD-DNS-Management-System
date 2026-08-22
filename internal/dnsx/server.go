@@ -20,6 +20,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"dns-platform/internal/config"
+	"dns-platform/internal/model"
 )
 
 // Server binds all downstream listeners:
@@ -41,7 +42,8 @@ type Server struct {
 	doh *http.Server
 	doq *quic.Listener
 
-	tlsConf *tls.Config
+	tlsConf   *tls.Config
+	certStore *CertStore
 
 	lns  []net.Listener
 	wg   sync.WaitGroup
@@ -50,7 +52,7 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, core *Core) (*Server, error) {
-	s := &Server{cfg: cfg, core: core}
+	s := &Server{cfg: cfg, core: core, certStore: NewCertStore(cfg.CertDir)}
 
 	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {
@@ -71,18 +73,32 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
 		},
-		// Per-connection tenant resolution by SNI prefix. Unknown prefixes
-		// fail the handshake → the prefix inventory is never enumerable.
+		// Per-connection tenant resolution by SNI. Custom main domains
+		// (customer-owned) get their own certificate; unknown prefixes/names
+		// fail the handshake → the inventory is never enumerable.
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			prefix := prefixFromSNI(hello.ServerName, cfg.BaseDomain)
-			if prefix == "" {
-				// bare base domain or unrelated name: allow base-domain only
-				if strings.EqualFold(hello.ServerName, cfg.BaseDomain) {
-					return s.tlsConf.Clone(), nil
+			host := strings.ToLower(strings.TrimSuffix(hello.ServerName, "."))
+			ctx := context.Background()
+			// 1) customer custom main domain (tenant_domains) + its cert
+			if t, err := core.repos.TenantByDomain(ctx, host); err == nil && t != nil && t.DoTEnabled {
+				if cert := s.certStore.Get(host); cert != nil {
+					cc := s.tlsConf.Clone()
+					cc.Certificates = []tls.Certificate{*cert}
+					return cc, nil
 				}
+				return s.tlsConf.Clone(), nil
+			}
+			// 2) platform base domain & subdomains (wildcard cert)
+			base := strings.ToLower(strings.TrimSuffix(cfg.BaseDomain, "."))
+			if host == base || strings.HasSuffix(host, "."+base) {
+				return s.tlsConf.Clone(), nil
+			}
+			// 3) tenant prefix routing (prefix.base_domain)
+			prefix := prefixFromSNI(host, cfg.BaseDomain)
+			if prefix == "" {
 				return nil, errors.New("unrecognized server name")
 			}
-			t, err := core.repos.TenantByPrefix(context.Background(), prefix)
+			t, err := core.repos.TenantByPrefix(ctx, prefix)
 			if err != nil || t == nil || !t.DoTEnabled {
 				return nil, errors.New("unknown or disabled DoT prefix")
 			}
@@ -91,8 +107,11 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 	}
 
 	handler := dns.HandlerFunc(core.ServeDNS)
-	s.udp = &dns.Server{Addr: cfg.DNSListenUDP, Net: "udp", Handler: handler, UDPSize: 4096}
-	s.tcp = &dns.Server{Addr: cfg.DNSListenTCP, Net: "tcp", Handler: handler}
+	s.udp = &dns.Server{
+		Addr: cfg.DNSListenUDP, Net: "udp", Handler: handler, UDPSize: 4096,
+		ReusePort: true, // Linux: SO_REUSEPORT — multi-instance on one host / kernel LB
+	}
+	s.tcp = &dns.Server{Addr: cfg.DNSListenTCP, Net: "tcp", Handler: handler, ReusePort: true}
 
 	dohTLS := s.tlsConf.Clone()
 	dohTLS.NextProtos = []string{"h2", "http/1.1"}
@@ -176,10 +195,8 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 	sni := tc.ConnectionState().ServerName
 	meta := &RequestMeta{Via: "dot", SNI: sni}
 	meta.Prefix = prefixFromSNI(sni, s.cfg.BaseDomain)
-	if meta.Prefix != "" {
-		if t, err := s.core.repos.TenantByPrefix(context.Background(), meta.Prefix); err == nil {
-			meta.Tenant = t
-		}
+	if t, _ := s.resolveTenant(context.Background(), sni); t != nil {
+		meta.Tenant = t
 	}
 	meta.ClientIP = clientIP(conn.RemoteAddr())
 
@@ -347,9 +364,21 @@ func readRawDNSMessage(r *bufio.Reader) (*dns.Msg, error) {
 func (s *Server) dohHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.serveDoH)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.core.PingCache(ctx); err != nil {
+			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"service":"dns-platform-doh","status":"ok","endpoints":["/dns-query"]}`))
+		w.Write([]byte(`{"service":"dns-platform-doh","status":"ok","endpoints":["/dns-query","/healthz","/readyz"]}`))
 	})
 	return securityHeaders(mux)
 }
@@ -361,10 +390,8 @@ func (s *Server) serveDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := &RequestMeta{Via: "doh", SNI: host}
 	meta.Prefix = prefixFromSNI(host, s.cfg.BaseDomain)
-	if meta.Prefix != "" {
-		if t, err := s.core.repos.TenantByPrefix(r.Context(), meta.Prefix); err == nil {
-			meta.Tenant = t
-		}
+	if t, _ := s.resolveTenant(r.Context(), host); t != nil {
+		meta.Tenant = t
 	}
 	meta.ClientIP = clientIPFromRequest(r)
 
@@ -443,10 +470,23 @@ func (s *Server) startDoQ() error {
 		if err != nil {
 			return err
 		}
-		go doqServeConn(context.Background(), conn, func(ctx context.Context, msg *dns.Msg, clientIP net.IP, meta *RequestMeta) *dns.Msg {
-			resp, _ := s.core.Process(ctx, msg, meta)
-			return resp
-		})
+		go func(conn *quic.Conn) {
+			sni := ""
+			if st := conn.ConnectionState(); st.TLS.ServerName != "" {
+				sni = st.TLS.ServerName
+			}
+			doqServeConn(context.Background(), conn, func(ctx context.Context, msg *dns.Msg, clientIP net.IP, meta *RequestMeta) *dns.Msg {
+				if sni != "" {
+					meta.SNI = sni
+					meta.Prefix = prefixFromSNI(sni, s.cfg.BaseDomain)
+					if t, _ := s.resolveTenant(ctx, sni); t != nil {
+						meta.Tenant = t
+					}
+				}
+				resp, _ := s.core.Process(ctx, msg, meta)
+				return resp
+			})
+		}(conn)
 	}
 }
 
@@ -479,6 +519,32 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // --- helpers ---
+
+// resolveTenant maps an SNI/host to a tenant: customer custom main domain
+// first (exact or any subdomain), then <prefix>.<base_domain> prefix routing.
+func (s *Server) resolveTenant(ctx context.Context, host string) (*model.Tenant, string) {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return nil, ""
+	}
+	if t, err := s.core.repos.TenantByDomain(ctx, host); err == nil && t != nil {
+		return t, "domain"
+	}
+	prefix := prefixFromSNI(host, s.cfg.BaseDomain)
+	if prefix != "" {
+		if t, err := s.core.repos.TenantByPrefix(ctx, prefix); err == nil && t != nil {
+			return t, "prefix"
+		}
+	}
+	return nil, ""
+}
+
+// RefreshCerts rescans the per-domain certificate directory (called on config
+// reload and periodically so newly issued certs are picked up without a
+// restart).
+func (s *Server) RefreshCerts() {
+	s.certStore.Reload()
+}
 
 // prefixFromSNI extracts a single-label tenant prefix from "prefix.base".
 func prefixFromSNI(sni, baseDomain string) string {

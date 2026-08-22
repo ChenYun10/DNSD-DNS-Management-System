@@ -148,6 +148,13 @@ node frontend/server.js     # 前端 http://127.0.0.1:8081
 - [API 参考](docs/api.md) — 全部 REST 端点
 - [配置参考](.env.example) — 环境变量说明
 
+## 高并发 & 集群
+
+- 热路径零 Redis 往返(L1 本地缓存 + 限流本地优先 + ECS 批量上报 + 热点集内存化),详见 [docs/cluster.md](docs/cluster.md)
+- 集群:L4 LB(haproxy)+ N × dnsd + 共享 Redis/MySQL;SO_REUSEPORT 支持同机多实例;缓存失效走 Redis pub/sub 广播
+- 部署:deploy/cluster/(docker-compose 两实例示例、haproxy 裸机配置、systemd 模板)
+- 压测:tools/dnsbench(go run ./tools/dnsbench -server IP:53 -qps 10000 -dur 20s)
+
 ## License
 
-内部项目 / 保留所有权利。
+MIT License — 详见 LICENSE 文件。依赖均为宽松许可(MIT/BSD/Apache/MPL),无 GPL/AGPL。

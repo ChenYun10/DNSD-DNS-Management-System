@@ -90,6 +90,19 @@ type Config struct {
 	// POST /api/v1/bootstrap/admin endpoint can create the initial admin
 	// account. The endpoint disables itself once an admin exists.
 	BootstrapToken string
+
+	// Admin-managed SSL (ACME). Tenant custom main domains get certificates
+	// issued/renewed automatically from the backend; the base wildcard cert
+	// stays with the existing acme.sh flow (renew-dns-cert.sh).
+	ACMEEnabled           bool          // master switch for the ACME manager
+	ACMEEmail             string        // contact email for the CA
+	ACMEStaging           bool          // use Let's Encrypt staging (avoid rate limits while testing)
+	ACMEDirectoryURL      string        // explicit CA directory override
+	CertDir               string        // cert root: {CertDir}/domains/<domain>/{fullchain.pem,privkey.pem}
+	ACMEHTTPPort          string        // HTTP-01 challenge listener, e.g. 127.0.0.1:5002 (behind nginx)
+	AliyunAccessKeyID     string        // for DNS-01 issuance on Aliyun-hosted domains
+	AliyunAccessKeySecret string
+	CertRenewBefore       time.Duration // renew when expiry is closer than this
 }
 
 // Load reads configuration from the environment. If path is non-empty and the
@@ -144,6 +157,15 @@ func Load(envFile string) (*Config, error) {
 		APICORSOrigins:        splitCSV(getenv("API_CORS_ORIGINS", "http://localhost:8081,http://127.0.0.1:8081")),
 		WarmupConcurrency:     getint("WARMUP_CONCURRENCY", 32),
 		BootstrapToken:        getenv("BOOTSTRAP_TOKEN", ""),
+		ACMEEnabled:           getbool("ACME_ENABLED", false),
+		ACMEEmail:             getenv("ACME_EMAIL", ""),
+		ACMEStaging:           getbool("ACME_STAGING", false),
+		ACMEDirectoryURL:      getenv("ACME_DIRECTORY_URL", ""),
+		CertDir:               getenv("CERT_DIR", "/etc/dns-platform/certs"),
+		ACMEHTTPPort:          getenv("ACME_HTTP_PORT", "127.0.0.1:5002"),
+		AliyunAccessKeyID:     getenv("ALIYUN_ACCESS_KEY_ID", ""),
+		AliyunAccessKeySecret: getenv("ALIYUN_ACCESS_KEY_SECRET", ""),
+		CertRenewBefore:       getdur("CERT_RENEW_BEFORE", 720*time.Hour),
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

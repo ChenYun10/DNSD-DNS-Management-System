@@ -37,12 +37,23 @@ func NewLimiter(rdb *redis.Client, qps, vipMul int) *Limiter {
 func (l *Limiter) redisOK() bool { return l.rdb != nil }
 
 // AllowDNS checks whether (tenant, clientIP) may issue a query now.
+//
+// Local-first: the vast majority of traffic is well under the limit, so the
+// per-second window is decided in-process and Redis (cross-instance) is only
+// consulted once the local budget is exhausted. This removes 1 Redis
+// round-trip from the hot path while keeping a cluster-wide cap for abusive
+// sources. In a cluster the effective per-IP cap is ~N× the configured QPS
+// (per-instance budget); set RateLimitQPS per-instance accordingly.
 func (l *Limiter) AllowDNS(ctx context.Context, tenantID, clientIP string, vip bool) bool {
 	limit := l.qps
 	if vip && l.vipMul > 0 {
 		limit = l.qps * l.vipMul
 	}
 	key := fmt.Sprintf("dns:rate:%s:%s:%d", store.Safe(tenantID), store.Safe(clientIP), time.Now().Unix())
+	if l.memAllow("dns", key, limit) {
+		return true // under local budget — fast path, no Redis
+	}
+	// local budget exhausted → authoritative cross-instance check
 	if l.redisOK() {
 		n, err := l.rdb.Incr(ctx, key).Result()
 		if err == nil {
@@ -51,9 +62,9 @@ func (l *Limiter) AllowDNS(ctx context.Context, tenantID, clientIP string, vip b
 			}
 			return n <= int64(limit)
 		}
-		// redis hiccup: fall through to memory (fail-open with memory cap)
+		// Redis hiccup: fail closed for over-budget traffic
 	}
-	return l.memAllow("dns", key, limit)
+	return false
 }
 
 // AllowLogin caps failed login attempts per IP within a window.

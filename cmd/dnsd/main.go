@@ -142,7 +142,17 @@ func main() {
 					last = v
 					log.Printf("[config] hot reload applied (version %d)", v)
 				}
+				srv.RefreshCerts()
 			}
+		}
+	}()
+
+	// --- periodic cert scan: pick up ACME-issued domain certs without a reload ---
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			srv.RefreshCerts()
 		}
 	}()
 
@@ -154,6 +164,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	core.Warmup().Stop()
 	core.UpstreamManager().Close()
 	cache.Close()
 	mysql.Close()

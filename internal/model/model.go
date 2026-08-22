@@ -12,6 +12,31 @@ const (
 	RoleTenant Role = "tenant"
 )
 
+type CertStatus string
+
+const (
+	CertNone     CertStatus = "none"
+	CertIssuing  CertStatus = "issuing"
+	CertActive   CertStatus = "active"
+	CertRenewing CertStatus = "renewing"
+	CertError    CertStatus = "error"
+)
+
+// TenantDomain is a customer-owned main domain bound to a tenant (客户自定义
+// 主域名). Queries arriving with SNI/Host matching the domain or any subdomain
+// route to the tenant, and the platform issues/renews its TLS cert via ACME.
+type TenantDomain struct {
+	ID         string     `json:"id"`
+	TenantID   string     `json:"tenant_id"`
+	Domain     string     `json:"domain"`
+	Enabled    bool       `json:"enabled"`
+	CertStatus CertStatus `json:"cert_status"`
+	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
+	CertError  string     `json:"cert_error,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
 // Tenant is a customer workspace. Each tenant owns one or more custom
 // DoT/DoH prefixes (e.g. "acme-01.dns.example.com"). VIP tenants get a
 // reserved upstream pool, higher rate limits and the dedicated high-value

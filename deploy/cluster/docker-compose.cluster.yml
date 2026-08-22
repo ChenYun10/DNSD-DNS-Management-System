@@ -1,0 +1,160 @@
+# ============================================================================
+# dns-platform 集群版 docker-compose(两实例示例)
+#
+# 拓扑:
+#   haproxy(L4 LB:UDP/TCP 53 + DoT 853 + DoH 443 + DoQ 784 + apid 8080)
+#     ├── dnsd-1 (INSTANCE_ID=inst-1)
+#     ├── dnsd-2 (INSTANCE_ID=inst-2)
+#     ├── apid   (控制面,单实例;有状态部分在 MySQL/Redis)
+#     ├── redis  (共享缓存/限流/ECS 跟踪)
+#     └── mysql  (元数据/日志)
+#
+# 用法:
+#   cp .env.cluster.example .env.cluster && 编辑真实值
+#   docker compose -f deploy/cluster/docker-compose.cluster.yml --env-file .env.cluster up -d
+#
+# 证书:所有 dnsd 共享 ./certs 目录(通配符证书 + ACME 域证书)。
+#   生产建议:挂 NFS/对象存储同步,或用 apid 签发后 rsync 到各节点。
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env.cluster}
+      MYSQL_DATABASE: dns_platform
+      MYSQL_USER: dns
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set in .env.cluster}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  apid:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.apid
+    environment:
+      INSTANCE_ID: apid-1
+      ENV: prod
+      BASE_DOMAIN: ${BASE_DOMAIN}
+      CACHE_DRIVER: redis
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_DRIVER: mysql
+      MYSQL_DSN: "dns:${MYSQL_PASSWORD}@tcp(mysql:3306)/dns_platform?parseTime=true&charset=utf8mb4"
+      ACME_ENABLED: ${ACME_ENABLED:-false}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      ALIYUN_ACCESS_KEY_ID: ${ALIYUN_ACCESS_KEY_ID:-}
+      ALIYUN_ACCESS_KEY_SECRET: ${ALIYUN_ACCESS_KEY_SECRET:-}
+      JWT_SECRET: ${JWT_SECRET:?set in .env.cluster}
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+    restart: unless-stopped
+
+  # --- DNS 数据面 ×2(SO_REUSEPORT 已内置,同机多实例不冲突) ---
+  dnsd-1: &dnsd
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.dnsd
+    environment:
+      INSTANCE_ID: inst-1
+      ENV: prod
+      BASE_DOMAIN: ${BASE_DOMAIN}
+      DNS_LISTEN_UDP: ":53"
+      DNS_LISTEN_TCP: ":53"
+      DOT_LISTEN: ":853"
+      DOH_LISTEN: ":443"
+      DOQ_LISTEN: ":784"
+      CACHE_DRIVER: redis
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_DRIVER: mysql
+      MYSQL_DSN: "dns:${MYSQL_PASSWORD}@tcp(mysql:3306)/dns_platform?parseTime=true&charset=utf8mb4"
+      TLS_CERT_FILE: /app/certs/fullchain.pem
+      TLS_KEY_FILE: /app/certs/privkey.pem
+      DNSSEC_MODE: ${DNSSEC_MODE:-ad-only}
+      ECSPASSTHROUGH: ${ECSPASSTHROUGH:-true}
+      RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-200}
+      CACHE_MAX_TTL: 6h
+      NEG_CACHE_TTL: 30s
+      WARM_THRESHOLD: 60s
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+    restart: unless-stopped
+
+  dnsd-2:
+    <<: *dnsd
+    environment:
+      INSTANCE_ID: inst-2
+      ENV: prod
+      BASE_DOMAIN: ${BASE_DOMAIN}
+      DNS_LISTEN_UDP: ":53"
+      DNS_LISTEN_TCP: ":53"
+      DOT_LISTEN: ":853"
+      DOH_LISTEN: ":443"
+      DOQ_LISTEN: ":784"
+      CACHE_DRIVER: redis
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_DRIVER: mysql
+      MYSQL_DSN: "dns:${MYSQL_PASSWORD}@tcp(mysql:3306)/dns_platform?parseTime=true&charset=utf8mb4"
+      TLS_CERT_FILE: /app/certs/fullchain.pem
+      TLS_KEY_FILE: /app/certs/privkey.pem
+      DNSSEC_MODE: ${DNSSEC_MODE:-ad-only}
+      ECSPASSTHROUGH: ${ECSPASSTHROUGH:-true}
+      RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-200}
+      CACHE_MAX_TTL: 6h
+      NEG_CACHE_TTL: 30s
+      WARM_THRESHOLD: 60s
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy.compose.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "853:853/tcp"
+      - "443:443/tcp"
+      - "784:784/udp"
+      - "8080:8080/tcp"   # apid 经 LB 暴露(前端 nginx 走这里)
+    depends_on:
+      - dnsd-1
+      - dnsd-2
+      - apid
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  mysql-data:
