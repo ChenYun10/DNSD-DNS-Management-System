@@ -110,6 +110,7 @@ fi
 systemctl restart redis-server
 sed -i "s|^API_CORS_ORIGINS=.*|API_CORS_ORIGINS=https://${DOMAIN}:8002,https://${DOMAIN}:8001,http://${DOMAIN},http://127.0.0.1:8081|" /etc/dns-platform/.env
 cp /etc/dns-platform/.env "$ROOT/.env"
+chmod 0600 /etc/dns-platform/.env
 
 # ---------- 5. 证书 ----------
 say "签发证书 (*.${DOMAIN} + ${DOMAIN}) ..."
@@ -255,10 +256,27 @@ echo "  DoT              : ${DOMAIN}:853 (TCP)"
 echo "  DoQ              : ${DOMAIN}:853 (UDP)"
 echo "  明文 DNS         : ${DOMAIN}:53 (UDP/TCP)"
 echo "  管理员           : admin / ${ADMIN_PW}"
+echo "  MySQL dns 用户   : dns / ${MYSQLP}"
+echo "  Redis            : requirepass ${RPW}"
+echo "  API JWT_SECRET   : ${JWT}"
+echo "  BOOTSTRAP_TOKEN  : ${BT}"
 echo "  租户前缀示例     : xxx.${DOMAIN} → 租户 xxx"
 echo "  证书             : /etc/dns-platform/certs/"
 echo "  配置文件         : /etc/dns-platform/.env"
 echo "====================================================="
+# 凭据汇总(0600,仅 root/dns 可读)
+cat > /etc/dns-platform/credentials.txt <<EOF
+[dns-platform credentials - $(date -Is)]
+主域名          : ${DOMAIN}
+管理员          : admin / ${ADMIN_PW}
+MySQL dns 用户  : dns / ${MYSQLP}
+Redis           : requirepass ${RPW}
+API JWT_SECRET  : ${JWT}
+BOOTSTRAP_TOKEN : ${BT}
+配置文件        : /etc/dns-platform/.env
+EOF
+chmod 0600 /etc/dns-platform/credentials.txt
+chown dns:dns /etc/dns-platform/credentials.txt 2>/dev/null || true
 echo "提示: 1) 阿里云安全组需放行 53/443/853(TCP+UDP)/8001/8002;"
 echo "     2) 管理员登录后请立即修改密码;"
 echo "     3) 部署后执行: systemctl status dns-platform-dnsd dns-platform-apid"
