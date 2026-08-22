@@ -1,0 +1,16 @@
+# dns-platform 生产镜像(极简版)
+# 二进制由本机/CI 交叉编译(静态, CGO=0),这里只做 COPY,不编译——
+# 适合低内存机器(docker build 几乎零内存占用)。
+#
+# 构建:
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/linux/dnsd ./cmd/dnsd
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/linux/apid ./cmd/apid
+#   docker build -f deploy/docker/Dockerfile.dnsd -t dnsd:prod .
+#   docker build -f deploy/docker/Dockerfile.apid -t apid:prod .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata && addgroup -S dns && adduser -S -G dns dns
+COPY --chmod=755 bin/linux/dnsd /usr/local/bin/dnsd
+USER dns
+EXPOSE 53/udp 53/tcp 853/tcp 443/tcp 784/udp
+ENTRYPOINT ["dnsd", "-env", "/app/.env"]

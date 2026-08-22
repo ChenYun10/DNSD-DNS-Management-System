@@ -49,9 +49,7 @@ services:
       retries: 10
 
   apid:
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile.apid
+    image: crpi-9tbce2mjaaxu2yp6.cn-hangzhou.personal.cr.aliyuncs.com/dnsd-dns-management-system/dns-platform:apid-1.0.0
     environment:
       INSTANCE_ID: apid-1
       ENV: prod
@@ -75,9 +73,7 @@ services:
 
   # --- DNS 数据面 ×2(SO_REUSEPORT 已内置,同机多实例不冲突) ---
   dnsd-1: &dnsd
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile.dnsd
+    image: crpi-9tbce2mjaaxu2yp6.cn-hangzhou.personal.cr.aliyuncs.com/dnsd-dns-management-system/dns-platform:dnsd-1.0.0
     environment:
       INSTANCE_ID: inst-1
       ENV: prod

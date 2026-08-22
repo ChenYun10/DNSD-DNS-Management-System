@@ -42,9 +42,9 @@ services:
     networks: [dnsnet]
 
   dnsd:
-    build:
-      context: .
-      dockerfile: deploy/Dockerfile.dnsd
+    # 镜像来自阿里云 ACR(预编译二进制,~20MB);本地开发可改回 build:
+    #   build: { context: ., dockerfile: deploy/Dockerfile.dnsd }
+    image: crpi-9tbce2mjaaxu2yp6.cn-hangzhou.personal.cr.aliyuncs.com/dnsd-dns-management-system/dns-platform:dnsd-1.0.0
     restart: unless-stopped
     env_file: .env
     environment:
@@ -67,9 +67,9 @@ services:
     networks: [dnsnet]
 
   apid:
-    build:
-      context: .
-      dockerfile: deploy/Dockerfile.apid
+    # 镜像来自阿里云 ACR;本地开发可改回 build:
+    #   build: { context: ., dockerfile: deploy/Dockerfile.apid }
+    image: crpi-9tbce2mjaaxu2yp6.cn-hangzhou.personal.cr.aliyuncs.com/dnsd-dns-management-system/dns-platform:apid-1.0.0
     restart: unless-stopped
     env_file: .env
     environment:
