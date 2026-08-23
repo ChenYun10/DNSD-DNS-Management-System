@@ -245,10 +245,13 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		total = cached
 	} else {
 		// 封顶 COUNT:表已数千万行规模,精确 COUNT 要扫整个索引(数秒~十几秒)。
-		// MariaDB LIMIT ROWS EXAMINED 让扫描在检查 cap 行后停止——
 		// 分页 UI 只需要“还有没有更多”,超过 10000 条返回 10000 足够。
+		// 注意:MariaDB 的 LIMIT ROWS EXAMINED 在命中上限时对 COUNT(*) 返回
+		// 空结果集(导致 sql.ErrNoRows 500),必须用派生表:内层 LIMIT 10001
+		// 返回部分行(走覆盖索引扫描,~0.05s),外层再 COUNT。
 		const maxCountRows = 10001
-		countQ := "SELECT COUNT(*) FROM query_logs" + w + " LIMIT ROWS EXAMINED " + strconv.Itoa(maxCountRows)
+		countQ := "SELECT COUNT(*) FROM (SELECT 1 FROM query_logs" + w +
+			" LIMIT " + strconv.Itoa(maxCountRows) + ") AS _c"
 		if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
 			return nil, 0, err
 		}
