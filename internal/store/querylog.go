@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -243,7 +244,12 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 	if cached, ok := queryCountCache.get(key.String()); ok {
 		total = cached
 	} else {
-		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM query_logs"+w, args...).Scan(&total); err != nil {
+		// 封顶 COUNT:表已数千万行规模,精确 COUNT 要扫整个索引(数秒~十几秒)。
+		// MariaDB LIMIT ROWS EXAMINED 让扫描在检查 cap 行后停止——
+		// 分页 UI 只需要“还有没有更多”,超过 10000 条返回 10000 足够。
+		const maxCountRows = 10001
+		countQ := "SELECT COUNT(*) FROM query_logs" + w + " LIMIT ROWS EXAMINED " + strconv.Itoa(maxCountRows)
+		if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
 			return nil, 0, err
 		}
 		queryCountCache.put(key.String(), total)
