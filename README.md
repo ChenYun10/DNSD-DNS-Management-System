@@ -14,7 +14,7 @@
 
 一个完整的 DNS 服务平台:UDP/TCP 传统解析 + **DoT + DoH + DoQ** 四类下行协议、
 **多租户 DoT/DoH 前缀定制**、**ECS(EDNS Client Subnet)模拟与传递**、Redis 缓存、
-MySQL 查询日志、基于 ECS 的动态预热、上游多协议分流、DNSSEC、**后台自动签发 SSL
+MariaDB 查询日志、基于 ECS 的动态预热、上游多协议分流、DNSSEC、**后台自动签发 SSL
 (ACME)**、集群化部署与完整的前后端分离管理控制台。
 
 [架构设计](docs/architecture.md) · [安全设计](docs/security.md) ·
@@ -30,7 +30,7 @@ MySQL 查询日志、基于 ECS 的动态预热、上游多协议分流、DNSSEC
 | **DoT 前缀定制** | 每租户独立前缀 `gov-acme01.dns.example.com`,SNI 路由租户;未知前缀在 **TLS 握手层直接拒绝**(前缀不可枚举) |
 | **ECS 模拟/传递** | 解析客户端 EDNS Client Subnet(RFC 7871),按策略透传上游、回显 scope;**前端可模拟任意子网的完整解析路径**(缓存→分流→上游→DNSSEC) |
 | **缓存(Redis+L1)** | 按 `租户×ECS×域名×类型` 粒度缓存,TTL 自适应、负缓存(SOA min)、单飞防击穿;**进程内 L1 热缓存**(64 分片)+ Redis L2,**集群跨实例失效走 pub/sub 广播** |
-| **日志(MySQL)** | 全量查询日志异步批量落库(不阻塞请求路径),审计日志只追加;管理端按租户/域名/时间检索 |
+| **日志(MariaDB)** | 全量查询日志异步批量落库(不阻塞请求路径),审计日志只追加;管理端按租户/域名/时间检索 |
 | **动态预热** | ①活跃 ECS 自动追踪(Redis Set);②热域名×活跃 ECS 一键预热;③热点临近过期条目自适应异步刷新 |
 | **上游分流** | 组/成员 CRUD(udp/tcp/dot/doh/doq),后缀/前缀/精确/正则/全量规则,优先级排序,租户级规则覆盖全局;组内加权轮询/故障切换,健康检查自动剔除故障节点 |
 | **上游协议** | 传统 UDP/TCP、DoT、DoH(RFC 8484 POST)、DoQ(RFC 9250 QUIC) |
@@ -61,12 +61,12 @@ MySQL 查询日志、基于 ECS 的动态预热、上游多协议分流、DNSSEC
                     (udp/tcp/dot/doh/doq)   └───────┬────────┘
                                       │              │
                     ┌─────────────────▼──┐   ┌───────▼────────┐
-                    │ Redis (L2 缓存 /   │   │ MySQL (配置 /  │
+                    │ Redis (L2 缓存 /   │   │ MariaDB (配置 /  │
                     │  限流 / ECS 跟踪)  │   │  查询日志)     │
                     └────────────────────┘   └────────────────┘
 ```
 
-集群模式:`haproxy(L4)→ N × dnsd`,共享 Redis/MySQL。详见 [docs/cluster.md](docs/cluster.md)。
+集群模式:`haproxy(L4)→ N × dnsd`,共享 Redis/MariaDB。详见 [docs/cluster.md](docs/cluster.md)。
 
 ## 性能
 
@@ -86,7 +86,7 @@ MySQL 查询日志、基于 ECS 的动态预热、上游多协议分流、DNSSEC
 
 ```bash
 sudo bash scripts/install-linux.sh
-# 自动完成:Redis+MySQL → 建库 → 交叉编译静态二进制 → systemd 服务 → nginx 前端
+# 自动完成:Redis+MariaDB → 建库 → 交叉编译静态二进制 → systemd 服务 → nginx 前端
 # 按脚本末尾提示调用 bootstrap 创建管理员
 ```
 
@@ -119,9 +119,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/bootstrap/admin \
 
 ```powershell
 # Windows:
-.\scripts\start-dev.ps1     # 自动下载 Redis+MySQL、初始化、生成证书
+.\scripts\start-dev.ps1     # 自动下载 Redis+MySQL 8.0 portable、初始化、生成证书
 # Linux:
-bash scripts/start-dev.sh   # 使用系统 redis/mysql
+bash scripts/start-dev.sh   # 使用系统 redis/mysql(或 mariadb)
 
 go run ./cmd/dnsd           # 数据面(开发端口 :5300/853/9443/784,避开本机 53 占用)
 go run ./cmd/apid           # 控制面 :8080 / :8443
@@ -152,7 +152,7 @@ node frontend/server.js     # 前端 http://127.0.0.1:8081
 ✓ ECS 传递 + scope 回显 scope="116.62.52.0/0"
 ✓ 分流规则 .cn → 国内组 → 223.5.5.5(CNAME 链完整解析)
 ✓ Redis 缓存命中(二次模拟 0ms 返回)
-✓ MySQL 查询日志(23 条 / 5 通道 / 异步批量)
+✓ MariaDB 查询日志(23 条 / 5 通道 / 异步批量)
 ✓ 预热任务(域名×ECS=2 组合,2/2 成功)
 ✓ 租户全字段编辑 / 上游 DoQ 成员添加(热加载生效)
 ```
@@ -162,7 +162,7 @@ node frontend/server.js     # 前端 http://127.0.0.1:8081
 ```bash
 cp deploy/cluster/.env.cluster.example .env.cluster
 docker compose -f deploy/cluster/docker-compose.cluster.yml --env-file .env.cluster up -d
-# haproxy(53/853/443/784/8080)→ dnsd-1 + dnsd-2 + apid + redis + mysql
+# haproxy(53/853/443/784/8080)→ dnsd-1 + dnsd-2 + apid + redis + mariadb
 ```
 
 裸机:配合 `deploy/cluster/haproxy.cfg` + `deploy/cluster/dnsd@.service`
@@ -190,7 +190,7 @@ cmd/gencert/     # 自签名泛域名证书生成工具(开发用)
 internal/dnsx/   # 核心:监听器 / ECS / 缓存(L1+L2) / 上游 / 分流 / DNSSEC / 预热 / 限流
 internal/certmgr/# ACME 签发与续期(lego)
 internal/api/    # REST 端点(鉴权、租户、上游、缓存、模拟、日志)
-internal/store/  # Redis 缓存 + MySQL 存储 + 异步日志写入器
+internal/store/  # Redis 缓存 + MariaDB 存储 + 异步日志写入器
 frontend/        # 管理控制台 SPA(原生 JS,无构建步骤)
 deploy/          # Dockerfile ×2 / nginx / systemd / cluster(haproxy+compose)
 tools/dnsbench/  # UDP/TCP 压测工具
@@ -213,7 +213,7 @@ docs/            # 架构 / 安全 / API / 集群
 A complete DNS service platform built in Go: traditional UDP/TCP resolution
 plus **DoT / DoH / DoQ** encrypted transports, per-tenant DoT/DoH prefix
 customization, **ECS (EDNS Client Subnet)** simulation & passthrough, Redis
-caching, MySQL query logging, dynamic pre-warming, multi-protocol upstream
+caching, MariaDB query logging, dynamic pre-warming, multi-protocol upstream
 split routing, DNSSEC, backend-managed SSL (ACME), cluster deployment and a
 full web admin console.
 
@@ -230,7 +230,7 @@ full web admin console.
 | **Multi-tenancy** | Per-tenant custom DoT prefix via SNI, unknown prefixes rejected at TLS handshake (prefix not enumerable) |
 | **ECS** | EDNS Client Subnet (RFC 7871) passthrough, scope echo, and a full ECS simulation path (cache → split → upstream → DNSSEC) |
 | **Caching** | Redis L2 + in-process L1 hot cache; per `tenant × ECS × qname × qtype` keying; TTL-adaptive; negative caching (SOA min); cross-instance invalidation via Redis pub/sub |
-| **Logging** | Full query log to MySQL, asynchronous batch writer (never blocks the hot path), admin searchable by tenant / domain / time |
+| **Logging** | Full query log to MariaDB, asynchronous batch writer (never blocks the hot path), admin searchable by tenant / domain / time |
 | **Dynamic pre-warm** | Active-ECS auto-tracking → one-click tenant warm-up; adaptive refresh of hot entries before expiry |
 | **Upstream split** | Groups + members (udp/tcp/dot/doh/doq), suffix/prefix/exact/regex/full rules, priority ordering, health checks with failover |
 | **DNSSEC** | `passthrough` / `ad-only` / `verify` (local RRSIG validation), DO-bit passthrough, AD-bit policy |
@@ -253,12 +253,12 @@ full web admin console.
                     (udp/tcp/dot/doh/doq)   └───────┬────────┘
                                       │              │
                     ┌─────────────────▼──┐   ┌───────▼────────┐
-                    │ Redis (L2 cache /  │   │ MySQL (config │
+                    │ Redis (L2 cache /  │   │ MariaDB (config │
                     │  rate limit / ECS) │   │  / logs)      │
                     └────────────────────┘   └────────────────┘
 ```
 
-Multi-instance deployment: `haproxy (L4) → N × dnsd`, shared Redis/MySQL.
+Multi-instance deployment: `haproxy (L4) → N × dnsd`, shared Redis/MariaDB.
 See [docs/cluster.md](docs/cluster.md).
 
 ## Performance
@@ -279,7 +279,7 @@ Benchmark: `go run ./tools/dnsbench -server <ip>:53 -qps 10000 -dur 20s`
 
 ```bash
 sudo bash scripts/install-linux.sh
-# Redis+MySQL → schema → static binaries → systemd services → nginx frontend
+# Redis+MariaDB → schema → static binaries → systemd services → nginx frontend
 # Then create the admin via the bootstrap endpoint (printed at the end)
 ```
 
@@ -299,7 +299,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/bootstrap/admin \
 
 ```powershell
 # Windows:
-.\scripts\start-dev.ps1      # auto-downloads Redis+MySQL, inits schema, generates certs
+.\scripts\start-dev.ps1      # auto-downloads Redis+MySQL 8.0 portable, inits schema, generates certs
 # Linux:
 bash scripts/start-dev.sh
 
@@ -322,7 +322,7 @@ node frontend/server.js      # console http://127.0.0.1:8081
 ```bash
 cp deploy/cluster/.env.cluster.example .env.cluster
 docker compose -f deploy/cluster/docker-compose.cluster.yml --env-file .env.cluster up -d
-# haproxy (53/853/443/784/8080) → dnsd-1 + dnsd-2 + apid + redis + mysql
+# haproxy (53/853/443/784/8080) → dnsd-1 + dnsd-2 + apid + redis + mariadb
 ```
 
 Bare-metal: `deploy/cluster/haproxy.cfg` + `deploy/cluster/dnsd@.service`
@@ -350,7 +350,7 @@ cmd/gencert/     # self-signed wildcard cert generator (dev)
 internal/dnsx/   # core: listeners / ECS / cache(L1+L2) / upstream / split / DNSSEC / warmup / rate limit
 internal/certmgr/# ACME issuance & renewal for tenant domains (lego)
 internal/api/    # REST handlers (auth, tenants, upstreams, cache, simulate, logs)
-internal/store/  # Redis cache + MySQL storage + async query log writer
+internal/store/  # Redis cache + MariaDB storage + async query log writer
 frontend/        # admin SPA (vanilla JS, no build step)
 deploy/          # Dockerfiles, nginx, systemd, cluster (haproxy/compose)
 tools/dnsbench/  # UDP/TCP load generator
