@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -157,6 +159,49 @@ func (s *MySQLStore) WriteAudit(ctx context.Context, a model.AuditRow) error {
 	return err
 }
 
+// countCache memoizes COUNT(*) results for a few seconds.
+// The logs page polls every few seconds; without this, each poll runs a
+// multi-million-row index scan (table grows ~8.6M rows/day) and the page
+// takes 4-8s per click. A short TTL is fine for pagination UI totals.
+type countCache struct {
+	mu sync.Mutex
+	m  map[string]cachedCount
+}
+
+type cachedCount struct {
+	total int64
+	exp   time.Time
+}
+
+var queryCountCache = &countCache{m: make(map[string]cachedCount)}
+
+func (c *countCache) get(key string) (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[key]
+	if !ok || time.Now().After(v.exp) {
+		if ok {
+			delete(c.m, key)
+		}
+		return 0, false
+	}
+	return v.total, true
+}
+
+func (c *countCache) put(key string, total int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = cachedCount{total: total, exp: time.Now().Add(10 * time.Second)}
+	// bound the map: opportunistically drop expired entries
+	if len(c.m) > 256 {
+		for k, v := range c.m {
+			if time.Now().After(v.exp) {
+				delete(c.m, k)
+			}
+		}
+	}
+}
+
 // QueryLogs returns paged query logs with optional filters (all parameters
 // are bound, never concatenated — no SQL injection surface).
 func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from, to string, limit, offset int) ([]model.QueryLogRow, int64, error) {
@@ -187,9 +232,21 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		limit = 100
 	}
 	w := " WHERE " + joinWhere(where)
+	// COUNT cache: same WHERE+args ⇒ same key. All args here are strings.
+	var key strings.Builder
+	key.WriteString(w)
+	for _, a := range args {
+		key.WriteString("|")
+		key.WriteString(a.(string))
+	}
 	var total int64
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM query_logs"+w, args...).Scan(&total); err != nil {
-		return nil, 0, err
+	if cached, ok := queryCountCache.get(key.String()); ok {
+		total = cached
+	} else {
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM query_logs"+w, args...).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+		queryCountCache.put(key.String(), total)
 	}
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT ts, tenant_id, client_ip, ecs, qname, qtype, rcode, cache_hit, upstream_group, upstream, rtt_ms, dnssec_ok, vip, via FROM query_logs"+w+

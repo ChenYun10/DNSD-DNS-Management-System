@@ -61,7 +61,11 @@ function copyBtn(text, label) {
 
 function fmtTime(s) {
   if (!s) return '-';
-  const d = new Date(s);
+  // 后端 ts 是 UTC 字符串(如 "2026-08-23 04:16:06.123"),无时区后缀。
+  // 直接 new Date() 会按本地时区解析,显示偏 8 小时 → 补 Z 按 UTC 解析再转本地。
+  let iso = String(s).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(iso)) iso = iso.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
   return isNaN(d) ? esc(s) : d.toLocaleString('zh-CN', { hour12: false });
 }
 
