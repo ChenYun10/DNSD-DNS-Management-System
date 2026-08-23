@@ -18,12 +18,17 @@ func (a *API) queryLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	// 性能保护:前端未指定时间范围时默认最近 24h(表有数百万行,全量扫描会拖垮查询)
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
+	if from == "" && to == "" {
+		from = time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+	}
 	rows, total, err := a.mysql.QueryLogs(r.Context(),
 		tenantID,
 		r.URL.Query().Get("qname"),
 		r.URL.Query().Get("qtype"),
-		r.URL.Query().Get("from"),
-		r.URL.Query().Get("to"),
+		from, to,
 		limit, offset)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

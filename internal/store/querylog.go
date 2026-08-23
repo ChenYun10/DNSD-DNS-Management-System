@@ -167,8 +167,9 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		args = append(args, tenantID)
 	}
 	if qname != "" {
-		where = append(where, "qname LIKE ?")
-		args = append(args, "%"+qname+"%")
+		// 后缀匹配(REVERSE 函数索引):避免前导 % 导致索引失效
+		where = append(where, "REVERSE(qname) LIKE ?")
+		args = append(args, reverseStr(qname)+"%")
 	}
 	if qtype != "" {
 		where = append(where, "qtype = ?")
@@ -257,4 +258,13 @@ func joinWhere(parts []string) string {
 		}
 	}
 	return out
+}
+
+// reverseStr reverses a string (for REVERSE(qname) indexed lookup).
+func reverseStr(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
 }
