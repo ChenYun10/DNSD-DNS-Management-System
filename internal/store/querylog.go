@@ -167,8 +167,8 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		args = append(args, tenantID)
 	}
 	if qname != "" {
-		// 后缀匹配(REVERSE 函数索引):避免前导 % 导致索引失效
-		where = append(where, "REVERSE(qname) LIKE ?")
+		// 后缀匹配(rev_qname 虚拟列索引):避免前导 % 导致索引失效
+		where = append(where, "rev_qname LIKE ?")
 		args = append(args, reverseStr(qname)+"%")
 	}
 	if qtype != "" {
