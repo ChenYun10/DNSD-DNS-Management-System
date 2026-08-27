@@ -150,4 +150,4 @@ node frontend/server.js     # 前端 http://127.0.0.1:8081
 
 ## License
 
-内部项目 / 保留所有权利。
+MIT 开源所有，可免费商用
