@@ -1,64 +1,63 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="referrer" content="no-referrer">
-<title>DNS 浜戝钩鍙?路 绠＄悊鎺у埗鍙?/title>
+<title>DNS 云平台 · 管理控制台</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <div id="app">
-  <!-- 鐧诲綍椤?-->
+  <!-- 登录页 -->
   <div id="view-login" class="login-wrap hidden">
     <div class="login-card">
-      <div class="login-logo">馃洝锔?DNS 浜戝钩鍙?/div>
-      <div class="login-sub">澶氱鎴?DoT / DoH / DoQ 路 ECS 鏅鸿兘瑙ｆ瀽 路 鍔ㄦ€侀鐑?/div>
+      <div class="login-logo">🛡️ DNS 云平台</div>
+      <div class="login-sub">多租户 DoT / DoH / DoQ · ECS 智能解析 · 动态预热</div>
       <div class="form-group">
-        <label>API 鍦板潃</label>
+        <label>API 地址</label>
         <input id="login-api" type="text" placeholder="http://127.0.0.1:8080">
       </div>
       <div class="form-group">
-        <label>鐢ㄦ埛鍚?/label>
+        <label>用户名</label>
         <input id="login-user" type="text" autocomplete="username" placeholder="admin">
       </div>
       <div class="form-group">
-        <label>瀵嗙爜</label>
-        <input id="login-pass" type="password" autocomplete="current-password" placeholder="鈥⑩€⑩€⑩€⑩€⑩€⑩€⑩€?>
+        <label>密码</label>
+        <input id="login-pass" type="password" autocomplete="current-password" placeholder="••••••••">
       </div>
-      <button id="login-btn" class="btn btn-primary btn-block">鐧?褰?/button>
+      <button id="login-btn" class="btn btn-primary btn-block">登 录</button>
       <div id="login-msg" class="form-msg"></div>
     </div>
   </div>
 
-  <!-- 涓荤晫闈?-->
+  <!-- 主界面 -->
   <div id="view-main" class="shell hidden">
     <aside class="sidebar">
-      <div class="brand">馃洝锔?DNS 浜戝钩鍙?/div>
+      <div class="brand">🛡️ DNS 云平台</div>
       <nav id="nav">
-        <a data-view="dashboard" class="active">馃搳 鎬昏</a>
-        <a data-view="dot">馃攼 DoT/DoH 绔偣</a>
-        <a data-view="simulate">馃И ECS 妯℃嫙</a>
-        <a data-view="upstreams">馃攢 涓婃父涓庡垎娴?/a>
-        <a data-view="cache">鈿?缂撳瓨涓庨鐑?/a>
-        <a data-view="logs">馃摐 鏃ュ織鏌ヨ</a>
-        <a data-view="tenants" class="admin-only">馃彚 绉熸埛绠＄悊</a>
-        <a data-view="users" class="admin-only">馃懁 鐢ㄦ埛绠＄悊</a>
-        <a data-view="security" class="admin-only">馃洝锔?瀹夊叏涓績</a>
+        <a data-view="dashboard" class="active">📊 总览</a>
+        <a data-view="dot">🔐 DoT/DoH 端点</a>
+        <a data-view="simulate">🧪 ECS 模拟</a>
+        <a data-view="upstreams">🔀 上游与分流</a>
+        <a data-view="cache">⚡ 缓存与预热</a>
+        <a data-view="logs">📜 日志查询</a>
+        <a data-view="tenants" class="admin-only">🏢 租户管理</a>
+        <a data-view="users" class="admin-only">👤 用户管理</a>
+        <a data-view="security" class="admin-only">🛡️ 安全中心</a>
       </nav>
       <div class="sidebar-foot">
         <div id="whoami" class="whoami"></div>
-        <button id="logout-btn" class="btn btn-ghost btn-block">閫€鍑虹櫥褰?/button>
+        <button id="logout-btn" class="btn btn-ghost btn-block">退出登录</button>
       </div>
     </aside>
     <main class="content" id="content"></main>
   </div>
 </div>
 
-<script src="js/api.js?v=20260828b"></script>
-<script src="js/ui.js?v=20260828b"></script>
-<script src="js/views.js?v=20260828b"></script>
-<script src="js/app.js?v=20260828b"></script>
+<script src="js/api.js?v=20260828d"></script>
+<script src="js/ui.js?v=20260828c"></script>
+<script src="js/views.js?v=20260828c"></script>
+<script src="js/app.js?v=20260828c"></script>
 </body>
 </html>
-
