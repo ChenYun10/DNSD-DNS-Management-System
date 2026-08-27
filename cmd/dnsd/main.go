@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -78,6 +79,41 @@ func main() {
 	}
 	core.UpstreamManager().StartHealthChecks()
 
+	// --- live stats ? Redis (consumed by the API daemon's overview) ---
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		ctx := context.Background()
+		for range t.C {
+			qps, hitRate, errRate := core.Stats().Snapshot()
+			tq, th, te := core.Stats().Totals()
+			hitTotal := 0.0
+			errTotal := 0.0
+			if tq > 0 {
+				hitTotal = float64(th) / float64(tq) * 100.0
+				errTotal = float64(te) / float64(tq) * 100.0
+			}
+			payload, err := json.Marshal(map[string]any{
+				"instance_id":          cfg.InstanceID,
+				"qps":                  qps,
+				"hit_rate_pct":         hitRate,
+				"error_rate_pct":       errRate,
+				"hit_rate_total_pct":   hitTotal,
+				"error_rate_total_pct": errTotal,
+				"total_queries":        tq,
+				"total_hits":           th,
+				"total_errors":         te,
+				"ts":                   time.Now().Unix(),
+			})
+			if err != nil {
+				continue
+			}
+			if err := rdb.Set(ctx, "dns:stats:overview", payload, 15*time.Second).Err(); err != nil {
+				log.Printf("[stats] redis push failed: %v", err)
+			}
+		}
+	}()
+
 	// --- listeners ---
 	srv, err := dnsx.NewServer(cfg, core)
 	if err != nil {
@@ -87,6 +123,38 @@ func main() {
 		log.Fatalf("start: %v", err)
 	}
 	log.Printf("[dnsd] instance=%s ENV=%s base_domain=%s dnssec=%s ecs=%v", cfg.InstanceID, cfg.Env, cfg.BaseDomain, cfg.DNSSECMode, cfg.ECSPassthrough)
+
+	// --- config hot-reload: poll the version key bumped by the API daemon ---
+	go func() {
+		ctx := context.Background()
+		last := int64(-1)
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			v, err := rdb.Get(ctx, "dns:config:version").Int64()
+			if err != nil {
+				continue
+			}
+			if v != last {
+				if err := core.ReloadAll(ctx); err != nil {
+					log.Printf("[config] reload failed: %v", err)
+				} else {
+					last = v
+					log.Printf("[config] hot reload applied (version %d)", v)
+				}
+				srv.RefreshCerts()
+			}
+		}
+	}()
+
+	// --- periodic cert scan: pick up ACME-issued domain certs without a reload ---
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			srv.RefreshCerts()
+		}
+	}()
 
 	// --- graceful shutdown ---
 	sig := make(chan os.Signal, 1)

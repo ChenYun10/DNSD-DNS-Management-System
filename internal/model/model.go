@@ -41,6 +41,31 @@ type Tenant struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+// CertStatus is the ACME certificate lifecycle state of a tenant-bound domain.
+type CertStatus string
+
+const (
+	CertNone     CertStatus = "none"    // not requested yet
+	CertIssuing  CertStatus = "issuing" // issuance in progress
+	CertActive   CertStatus = "active"  // certificate valid
+	CertRenewing CertStatus = "renewing"
+	CertError    CertStatus = "error"   // issuance failed (see CertError field)
+)
+
+// TenantDomain is a customer's own domain bound to a tenant (主域名绑定);
+// the platform issues/renews its TLS certificate automatically.
+type TenantDomain struct {
+	ID          string     `json:"id"`
+	TenantID    string     `json:"tenant_id"`
+	Domain      string     `json:"domain"`
+	Enabled     bool       `json:"enabled"`
+	CertStatus  CertStatus `json:"cert_status"`
+	CertExpiry  *time.Time `json:"cert_expiry,omitempty"`
+	CertError   string     `json:"cert_error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
 func (t *Tenant) DotEndpoint() string {
 	if t.Prefix == "" {
 		return ""
@@ -141,33 +166,33 @@ type HotDomain struct {
 
 // QueryLogRow is one DNS query record written to MySQL asynchronously.
 type QueryLogRow struct {
-	TS          time.Time
-	TenantID    string
-	ClientIP    string
-	ECS         string
-	QName       string
-	QType       string
-	RCode       string
-	CacheHit    bool
-	UpstreamGrp string
-	Upstream    string
-	RTTMS       int
-	DNSSECOK    bool
-	VIP         bool
-	Via         string // udp|tcp|dot|doh|doq
+	TS          time.Time `json:"ts"`
+	TenantID    string    `json:"tenant_id"`
+	ClientIP    string    `json:"client_ip"`
+	ECS         string    `json:"ecs"`
+	QName       string    `json:"qname"`
+	QType       string    `json:"qtype"`
+	RCode       string    `json:"rcode"`
+	CacheHit    bool      `json:"cache_hit"`
+	UpstreamGrp string    `json:"upstream_group"`
+	Upstream    string    `json:"upstream"`
+	RTTMS       int       `json:"rtt_ms"`
+	DNSSECOK    bool      `json:"dnssec_ok"`
+	VIP         bool      `json:"vip"`
+	Via         string    `json:"via"` // udp|tcp|dot|doh|doq
 }
 
 type AuditRow struct {
-	TS        time.Time
-	ActorID   string
-	ActorName string
-	Action    string
-	Target    string
-	Detail    string // JSON string
-	ClientIP  string
-	PrevHash  string // 哈希链:上一条 entry_hash
-	EntryHash string // 本条 SHA-256
-	Verifier  string // 写入者标识
+	TS        time.Time `json:"ts"`
+	ActorID   string    `json:"actor_id"`
+	ActorName string    `json:"actor_name"`
+	Action    string    `json:"action"`
+	Target    string    `json:"target"`
+	Detail    string    `json:"detail"` // JSON string
+	ClientIP  string    `json:"client_ip"`
+	PrevHash  string    `json:"prev_hash"` // 哈希链:上一条 entry_hash
+	EntryHash string    `json:"entry_hash"` // 本条 SHA-256
+	Verifier  string    `json:"verifier"`  // 写入者标识
 }
 
 // SimulateResult is returned by the ECS simulation API ("前端ecs模拟"):

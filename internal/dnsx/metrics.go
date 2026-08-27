@@ -1,9 +1,12 @@
 package dnsx
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Stats keeps per-instance rolling counters (1-minute window of 1s buckets)
@@ -62,6 +65,24 @@ func (s *Stats) Snapshot() (qps float64, hitRate float64, errRate float64) {
 
 func (s *Stats) Totals() (q, hit, err uint64) {
 	return s.totalQ.Load(), s.totalHit.Load(), s.totalErr.Load()
+}
+
+// FlushToRedis writes the current snapshot + totals into a shared Redis key
+// so that the control plane (apid) can read cross-instance statistics.
+// Key: dns:stats:overview (HSET fields qps/hit_rate_pct/error_rate_pct/total_queries/total_hits/total_errors/instance_id).
+func (s *Stats) FlushToRedis(ctx context.Context, rdb *redis.Client, instanceID string) error {
+	qps, hitRate, errRate := s.Snapshot()
+	q, hit, err := s.Totals()
+	return rdb.HSet(ctx, "dns:stats:overview", map[string]any{
+		"instance_id":    instanceID,
+		"qps":            qps,
+		"hit_rate_pct":   hitRate,
+		"error_rate_pct": errRate,
+		"total_queries":  q,
+		"total_hits":     hit,
+		"total_errors":   err,
+		"updated_at":     time.Now().Unix(),
+	}).Err()
 }
 
 // ---------------------------------------------------------------------------

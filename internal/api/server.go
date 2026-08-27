@@ -24,6 +24,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"dns-platform/internal/certmgr"
 	"dns-platform/internal/config"
 	"dns-platform/internal/dnsx"
 	"dns-platform/internal/model"
@@ -39,10 +40,11 @@ type API struct {
 	rdb     *redis.Client
 	limiter *dnsx.Limiter
 	auth    *Auth
+	certs   *certmgr.Manager
 }
 
-func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client) *API {
-	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb}
+func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client, certs *certmgr.Manager) *API {
+	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb, certs: certs}
 	a.limiter = dnsx.NewLimiter(rdb, cfg.RateLimitQPS, cfg.RateLimitVIPMult)
 	a.auth = NewAuth(cfg, repos, mysql, rdb, a.limiter)
 	return a
@@ -124,15 +126,8 @@ func (a *API) Handler() http.Handler {
 
 	// logs: query(租户可看自己) / audit(仅审计管理员 auditadmin)
 	mux.HandleFunc("GET /api/v1/logs/query", a.chain(a.queryLogs, a.auth.authMiddleware))
-	// 审计日志: GitHub 开源版三权分立(auditadmin 专属);
-	// 服务器运营模式(ADMIN_FULL_AUDIT=true)下 admin 也可全量查看(运维需求)
-	if a.cfg.AdminFullAudit {
-		mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin, model.RoleAdmin)))
-		mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin, model.RoleAdmin)))
-	} else {
-		mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
-		mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
-	}
+	mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
+	mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
 
 	// stats
 	mux.HandleFunc("GET /api/v1/stats/overview", a.chain(a.statsOverview, a.auth.authMiddleware))

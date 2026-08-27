@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
+	"time"
 
 	"dns-platform/internal/model"
 )
@@ -176,13 +179,22 @@ func (a *API) reload(w http.ResponseWriter, r *http.Request) {
 func (a *API) afterConfigChange(r *http.Request, action, target string) {
 	// data plane reload + audit in one step
 	_ = a.core.ReloadAll(r.Context())
+	a.bumpConfig(r.Context())
 	a.auditAction(r, action, target, "")
+}
+
+// bumpConfig signals the data plane (dnsd) to hot-reload configuration.
+func (a *API) bumpConfig(ctx context.Context) {
+	if a.rdb != nil {
+		_ = a.rdb.Incr(ctx, "dns:config:version").Err()
+	}
 }
 
 // afterConfigChangeSnap 与 afterConfigChange 相同, 但审计 detail 带 before/after 操作快照
 // (等保三级: 操作可追溯性 - 记录操作前后关键数据状态)
 func (a *API) afterConfigChangeSnap(r *http.Request, action, target string, before, after any) {
 	_ = a.core.ReloadAll(r.Context())
+	a.bumpConfig(r.Context())
 	a.auditAction(r, action, target, map[string]any{
 		"before": before,
 		"after":  after,
@@ -230,17 +242,57 @@ func (a *API) deleteHotDomain(w http.ResponseWriter, r *http.Request) {
 // --- stats ---
 
 func (a *API) statsOverview(w http.ResponseWriter, r *http.Request) {
-	qps, hitRate, errRate := a.core.Stats().Snapshot()
-	tq, th, te := a.core.Stats().Totals()
 	c := claimsFrom(r)
 	resp := map[string]any{
 		"instance_id":    a.cfg.InstanceID,
-		"qps":            round2(qps),
-		"hit_rate_pct":   round2(hitRate),
-		"error_rate_pct": round2(errRate),
-		"total_queries":  tq,
-		"total_hits":     th,
-		"total_errors":   te,
+		"qps":            0,
+		"hit_rate_pct":   0,
+		"error_rate_pct": 0,
+		"total_queries":  0,
+		"total_hits":     0,
+		"total_errors":   0,
+	}
+	// 从 Redis 读 dnsd 上报的实时统计(dnsd 每 5s SET dns:stats:overview, 15s TTL)
+	if a.rdb != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		val, err := a.rdb.Get(ctx, "dns:stats:overview").Result()
+		cancel()
+		if err == nil && val != "" {
+			var m map[string]any
+			if json.Unmarshal([]byte(val), &m) == nil {
+				if v, ok := m["qps"].(float64); ok {
+					resp["qps"] = round2(v)
+				}
+				if v, ok := m["hit_rate_pct"].(float64); ok {
+					resp["hit_rate_pct"] = round2(v)
+				}
+				if v, ok := m["error_rate_pct"].(float64); ok {
+					resp["error_rate_pct"] = round2(v)
+				}
+				if v, ok := m["total_queries"].(float64); ok {
+					resp["total_queries"] = uint64(v)
+				}
+				if v, ok := m["total_hits"].(float64); ok {
+					resp["total_hits"] = uint64(v)
+				}
+				if v, ok := m["total_errors"].(float64); ok {
+					resp["total_errors"] = uint64(v)
+				}
+				if v, ok := m["instance_id"].(string); ok && v != "" {
+					resp["instance_id"] = v
+				}
+			}
+		} else {
+			// Redis 无数据: 回退本地 core(开发/单进程模式)
+			qps, hitRate, errRate := a.core.Stats().Snapshot()
+			tq, th, te := a.core.Stats().Totals()
+			resp["qps"] = round2(qps)
+			resp["hit_rate_pct"] = round2(hitRate)
+			resp["error_rate_pct"] = round2(errRate)
+			resp["total_queries"] = tq
+			resp["total_hits"] = th
+			resp["total_errors"] = te
+		}
 	}
 	if c != nil && c.Role == string(model.RoleTenant) {
 		resp["tenant_queries"] = a.core.TenantQueries(c.TID)

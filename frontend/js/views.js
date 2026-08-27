@@ -647,6 +647,8 @@ Views.tenants = {
   }
 };
 
+const ROLE_BADGE = { 'admin': badgeVip('管理员'), 'sysadmin': badgeVip('系统'), 'secadmin': badgeVip('安全'), 'auditadmin': badgeVip('审计'), 'tenant': badgeInfo('租户') };
+
 /* ============================ 用户管理 ============================ */
 Views.users = {
   title: '用户管理',
