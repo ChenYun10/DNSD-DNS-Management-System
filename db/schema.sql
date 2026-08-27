@@ -41,13 +41,26 @@ CREATE TABLE IF NOT EXISTS users (
   tenant_id       CHAR(36)     NULL,                    -- NULL = 平台管理员
   username        VARCHAR(64)  NOT NULL UNIQUE,
   password_hash   VARCHAR(255) NOT NULL,
-  role            ENUM('admin','tenant') NOT NULL DEFAULT 'tenant',
+  -- 等保三员分立: sysadmin 系统管理 / secadmin 安全管理 / auditadmin 审计管理 / tenant 租户
+  role            ENUM('admin','sysadmin','secadmin','auditadmin','tenant') NOT NULL DEFAULT 'tenant',
   email           VARCHAR(128) NULL,
   failed_attempts INT          NOT NULL DEFAULT 0,
   locked_until    DATETIME(3)  NULL,
   last_login      DATETIME(3)  NULL,
+  must_change_pwd TINYINT(1)   NOT NULL DEFAULT 0,     -- 首次发放/过期密码强制改密
+  pwd_changed_at  DATETIME(3)  NULL,                   -- 密码最近更新时间(定期更换策略)
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   CONSTRAINT fk_users_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- 历史密码(等保: 密码不可复用, 防回退)
+CREATE TABLE IF NOT EXISTS password_history (
+  id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id       CHAR(36)     NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_ph_user (user_id),
+  CONSTRAINT fk_ph_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------------------------------
@@ -139,17 +152,22 @@ CREATE TABLE IF NOT EXISTS query_logs (
 -- ---------------------------------------------------------------------------
 -- 审计日志（管理操作，不可删除/修改——由应用层只写）
 -- ---------------------------------------------------------------------------
+-- 审计日志(管理操作, 防篡改: 哈希链 prev_hash + entry_hash, 只追加)
 CREATE TABLE IF NOT EXISTS audit_logs (
-  id         BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  ts         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  actor_id   CHAR(36)     NULL,
-  actor_name VARCHAR(64)  NULL,
-  action     VARCHAR(64)  NOT NULL,
-  target     VARCHAR(255) NULL,
-  detail     JSON         NULL,
-  client_ip  VARCHAR(45)  NULL,
+  id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ts          DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  actor_id    CHAR(36)     NULL,
+  actor_name  VARCHAR(64)  NULL,
+  action      VARCHAR(64)  NOT NULL,
+  target      VARCHAR(255) NULL,
+  detail      JSON         NULL,
+  client_ip   VARCHAR(45)  NULL,
+  prev_hash   CHAR(64)     NULL,      -- 上一条审计日志的 entry_hash (SHA-256 hex), 首条为 genesis
+  entry_hash  CHAR(64)     NULL,      -- 本条日志的 SHA-256(prev_hash|ts|actor|action|target|detail|ip)
+  verifier    VARCHAR(64)  NULL,      -- 写入者标识(实例ID/服务名), 便于溯源
   INDEX idx_audit_ts (ts),
-  INDEX idx_audit_action (action)
+  INDEX idx_audit_action (action),
+  INDEX idx_audit_hash (entry_hash)
 ) ENGINE=InnoDB;
 
 -- ============================================================================
@@ -212,22 +230,3 @@ WHERE NOT EXISTS (SELECT 1 FROM split_rules WHERE name = 'cn-suffix');
 INSERT INTO hot_domains (id, tenant_id, domain, weight, enabled)
 SELECT 'dddddddd-0000-0000-0000-000000000001', NULL, 'example.com', 10, 1
 WHERE NOT EXISTS (SELECT 1 FROM hot_domains WHERE domain = 'example.com');
--- ============================================================================
--- Migration 2026-08-22: customer custom main domains (客户自定义主域名)
--- Usage: mysql -u root dns_platform < db/migration_20260822_tenant_domains.sql
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS tenant_domains (
-  id          CHAR(36)     NOT NULL PRIMARY KEY,
-  tenant_id   CHAR(36)     NOT NULL,
-  domain      VARCHAR(128) NOT NULL UNIQUE,          -- customer's own main domain (apex)
-  enabled     TINYINT(1)   NOT NULL DEFAULT 1,
-  cert_status ENUM('none','issuing','active','renewing','error') NOT NULL DEFAULT 'none',
-  cert_expiry DATETIME(3)  NULL,
-  cert_error  VARCHAR(255) NULL,
-  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  updated_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  CONSTRAINT fk_td_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-  INDEX idx_td_tenant (tenant_id),
-  INDEX idx_td_domain (domain)
-) ENGINE=InnoDB;

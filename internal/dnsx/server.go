@@ -1,8 +1,6 @@
 package dnsx
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -20,7 +18,6 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"dns-platform/internal/config"
-	"dns-platform/internal/model"
 )
 
 // Server binds all downstream listeners:
@@ -42,8 +39,7 @@ type Server struct {
 	doh *http.Server
 	doq *quic.Listener
 
-	tlsConf   *tls.Config
-	certStore *CertStore
+	tlsConf *tls.Config
 
 	lns  []net.Listener
 	wg   sync.WaitGroup
@@ -52,7 +48,7 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, core *Core) (*Server, error) {
-	s := &Server{cfg: cfg, core: core, certStore: NewCertStore(cfg.CertDir)}
+	s := &Server{cfg: cfg, core: core}
 
 	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {
@@ -73,32 +69,18 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
 		},
-		// Per-connection tenant resolution by SNI. Custom main domains
-		// (customer-owned) get their own certificate; unknown prefixes/names
-		// fail the handshake → the inventory is never enumerable.
+		// Per-connection tenant resolution by SNI prefix. Unknown prefixes
+		// fail the handshake → the prefix inventory is never enumerable.
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			host := strings.ToLower(strings.TrimSuffix(hello.ServerName, "."))
-			ctx := context.Background()
-			// 1) customer custom main domain (tenant_domains) + its cert
-			if t, err := core.repos.TenantByDomain(ctx, host); err == nil && t != nil && t.DoTEnabled {
-				if cert := s.certStore.Get(host); cert != nil {
-					cc := s.tlsConf.Clone()
-					cc.Certificates = []tls.Certificate{*cert}
-					return cc, nil
-				}
-				return s.tlsConf.Clone(), nil
-			}
-			// 2) platform base domain & subdomains (wildcard cert)
-			base := strings.ToLower(strings.TrimSuffix(cfg.BaseDomain, "."))
-			if host == base || strings.HasSuffix(host, "."+base) {
-				return s.tlsConf.Clone(), nil
-			}
-			// 3) tenant prefix routing (prefix.base_domain)
-			prefix := prefixFromSNI(host, cfg.BaseDomain)
+			prefix := prefixFromSNI(hello.ServerName, cfg.BaseDomain)
 			if prefix == "" {
+				// bare base domain or unrelated name: allow base-domain only
+				if strings.EqualFold(hello.ServerName, cfg.BaseDomain) {
+					return s.tlsConf.Clone(), nil
+				}
 				return nil, errors.New("unrecognized server name")
 			}
-			t, err := core.repos.TenantByPrefix(ctx, prefix)
+			t, err := core.repos.TenantByPrefix(context.Background(), prefix)
 			if err != nil || t == nil || !t.DoTEnabled {
 				return nil, errors.New("unknown or disabled DoT prefix")
 			}
@@ -107,11 +89,8 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 	}
 
 	handler := dns.HandlerFunc(core.ServeDNS)
-	s.udp = &dns.Server{
-		Addr: cfg.DNSListenUDP, Net: "udp", Handler: handler, UDPSize: 4096,
-		ReusePort: true, // Linux: SO_REUSEPORT — multi-instance on one host / kernel LB
-	}
-	s.tcp = &dns.Server{Addr: cfg.DNSListenTCP, Net: "tcp", Handler: handler, ReusePort: true}
+	s.udp = &dns.Server{Addr: cfg.DNSListenUDP, Net: "udp", Handler: handler, UDPSize: 4096}
+	s.tcp = &dns.Server{Addr: cfg.DNSListenTCP, Net: "tcp", Handler: handler}
 
 	dohTLS := s.tlsConf.Clone()
 	dohTLS.NextProtos = []string{"h2", "http/1.1"}
@@ -195,20 +174,30 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 	sni := tc.ConnectionState().ServerName
 	meta := &RequestMeta{Via: "dot", SNI: sni}
 	meta.Prefix = prefixFromSNI(sni, s.cfg.BaseDomain)
-	if t, _ := s.resolveTenant(context.Background(), sni); t != nil {
-		meta.Tenant = t
+	if meta.Prefix != "" {
+		if t, err := s.core.repos.TenantByPrefix(context.Background(), meta.Prefix); err == nil {
+			meta.Tenant = t
+		}
 	}
 	meta.ClientIP = clientIP(conn.RemoteAddr())
 
-	// RFC 7858: DNS messages are carried directly over the TLS stream.
-	// For compatibility with BIND's dig (which sends the RFC 1035 TCP-style
-	// 2-byte length prefix), both framings are accepted; the detected framing
-	// is used for the response.
-	r := bufio.NewReader(tc)
+	// RFC 1035 TCP framing: 2-byte length + message, persistent connection.
 	for {
-		msg, framing, err := readDNSMessageCompat(r)
-		if err != nil {
+		hdr := make([]byte, 2)
+		if _, err := io.ReadFull(tc, hdr); err != nil {
 			return
+		}
+		l := binary.BigEndian.Uint16(hdr)
+		if l == 0 {
+			return
+		}
+		body := make([]byte, l)
+		if _, err := io.ReadFull(tc, body); err != nil {
+			return
+		}
+		msg := new(dns.Msg)
+		if err := msg.Unpack(body); err != nil {
+			continue
 		}
 		resp, _ := s.core.Process(context.Background(), msg, meta)
 		if resp == nil {
@@ -218,145 +207,14 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 		if err != nil {
 			continue
 		}
-		if framing == "prefixed" {
-			out := make([]byte, 2+len(raw))
-			binary.BigEndian.PutUint16(out, uint16(len(raw)))
-			copy(out[2:], raw)
-			raw = out
-		}
+		out := make([]byte, 2+len(raw))
+		binary.BigEndian.PutUint16(out, uint16(len(raw)))
+		copy(out[2:], raw)
 		tc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := tc.Write(raw); err != nil {
+		if _, err := tc.Write(out); err != nil {
 			return
 		}
 	}
-}
-
-// readDNSMessageCompat reads one DNS message, auto-detecting the framing:
-//   - "raw"      RFC 7858: message bytes directly on the stream
-//   - "prefixed" RFC 1035 TCP style: 2-byte big-endian length + message
-//
-// A length prefix is assumed only when the first two bytes form a plausible
-// length AND the prefixed payload unpacks cleanly; otherwise the bytes are
-// re-interpreted as the start of a raw message.
-func readDNSMessageCompat(r *bufio.Reader) (*dns.Msg, string, error) {
-	var head [2]byte
-	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return nil, "", err
-	}
-	l := int(binary.BigEndian.Uint16(head[:]))
-	if l >= 12 && l <= 4096 {
-		body := make([]byte, l)
-		if _, err := io.ReadFull(r, body); err == nil {
-			m := new(dns.Msg)
-			if err := m.Unpack(body); err == nil && len(m.Question) >= 1 {
-				return m, "prefixed", nil
-			}
-			// Not a valid prefixed message: treat head+body as a raw message.
-			all := append(append([]byte{}, head[:]...), body...)
-			m2 := new(dns.Msg)
-			if err := m2.Unpack(all); err == nil && len(m2.Question) >= 1 {
-				return m2, "raw", nil
-			}
-		} else {
-			// Partial body: likely a raw message whose ID collided with a
-			// plausible length. Try the raw interpretation on what we have.
-			all := append(append([]byte{}, head[:]...), body...)
-			m3 := new(dns.Msg)
-			if err := m3.Unpack(all); err == nil && len(m3.Question) >= 1 {
-				return m3, "raw", nil
-			}
-		}
-		return nil, "", errors.New("unparseable DNS message")
-	}
-	// Raw (RFC 7858): head is the start of the message.
-	raw := io.MultiReader(bytes.NewReader(head[:]), r)
-	msg, err := readRawDNSMessage(bufio.NewReader(raw))
-	if err != nil {
-		return nil, "", err
-	}
-	return msg, "raw", nil
-}
-
-// readRawDNSMessage reads a single unframed DNS message (RFC 7858) from r by
-// walking the header counts and section lengths. Compression pointers in the
-// question section are handled (rare but legal).
-func readRawDNSMessage(r *bufio.Reader) (*dns.Msg, error) {
-	var hdr [12]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, 0, 512)
-	buf = append(buf, hdr[:]...)
-	qd := binary.BigEndian.Uint16(hdr[4:6])
-	an := binary.BigEndian.Uint16(hdr[6:8])
-	ns := binary.BigEndian.Uint16(hdr[8:10])
-	ar := binary.BigEndian.Uint16(hdr[10:12])
-	readN := func(n int) error {
-		chunk := make([]byte, n)
-		if _, err := io.ReadFull(r, chunk); err != nil {
-			return err
-		}
-		buf = append(buf, chunk...)
-		return nil
-	}
-	skipName := func() error {
-		for {
-			b, err := r.ReadByte()
-			if err != nil {
-				return err
-			}
-			buf = append(buf, b)
-			if b&0xC0 == 0xC0 { // compression pointer: 2 bytes total
-				b2, err := r.ReadByte()
-				if err != nil {
-					return err
-				}
-				buf = append(buf, b2)
-				return nil
-			}
-			if b == 0 {
-				return nil
-			}
-			if err := readN(int(b)); err != nil {
-				return err
-			}
-		}
-	}
-	skipSection := func(count int) error {
-		for i := 0; i < count; i++ {
-			if err := skipName(); err != nil {
-				return err
-			}
-			var rr [10]byte
-			if _, err := io.ReadFull(r, rr[:]); err != nil {
-				return err
-			}
-			buf = append(buf, rr[:]...)
-			rdlen := int(binary.BigEndian.Uint16(rr[8:10]))
-			if err := readN(rdlen); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for i := 0; i < int(qd); i++ {
-		if err := skipName(); err != nil {
-			return nil, err
-		}
-		if err := readN(4); err != nil { // qtype + qclass
-			return nil, err
-		}
-	}
-	for _, count := range []int{int(an), int(ns), int(ar)} {
-		if err := skipSection(count); err != nil {
-			return nil, err
-		}
-	}
-	msg := new(dns.Msg)
-	if err := msg.Unpack(buf); err != nil {
-		return nil, err
-	}
-	return msg, nil
 }
 
 // --- DoH (RFC 8484) ---
@@ -364,21 +222,9 @@ func readRawDNSMessage(r *bufio.Reader) (*dns.Msg, error) {
 func (s *Server) dohHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.serveDoH)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := s.core.PingCache(ctx); err != nil {
-			http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.Write([]byte("ok"))
-	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"service":"dns-platform-doh","status":"ok","endpoints":["/dns-query","/healthz","/readyz"]}`))
+		w.Write([]byte(`{"service":"dns-platform-doh","status":"ok","endpoints":["/dns-query"]}`))
 	})
 	return securityHeaders(mux)
 }
@@ -390,8 +236,10 @@ func (s *Server) serveDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := &RequestMeta{Via: "doh", SNI: host}
 	meta.Prefix = prefixFromSNI(host, s.cfg.BaseDomain)
-	if t, _ := s.resolveTenant(r.Context(), host); t != nil {
-		meta.Tenant = t
+	if meta.Prefix != "" {
+		if t, err := s.core.repos.TenantByPrefix(r.Context(), meta.Prefix); err == nil {
+			meta.Tenant = t
+		}
 	}
 	meta.ClientIP = clientIPFromRequest(r)
 
@@ -470,23 +318,11 @@ func (s *Server) startDoQ() error {
 		if err != nil {
 			return err
 		}
-		go func(conn *quic.Conn) {
-			sni := ""
-			if st := conn.ConnectionState(); st.TLS.ServerName != "" {
-				sni = st.TLS.ServerName
-			}
-			doqServeConn(context.Background(), conn, func(ctx context.Context, msg *dns.Msg, clientIP net.IP, meta *RequestMeta) *dns.Msg {
-				if sni != "" {
-					meta.SNI = sni
-					meta.Prefix = prefixFromSNI(sni, s.cfg.BaseDomain)
-					if t, _ := s.resolveTenant(ctx, sni); t != nil {
-						meta.Tenant = t
-					}
-				}
-				resp, _ := s.core.Process(ctx, msg, meta)
-				return resp
-			})
-		}(conn)
+		go doqServeConn(context.Background(), conn, func(ctx context.Context, msg *dns.Msg, clientIP net.IP, meta *RequestMeta) *dns.Msg {
+			meta.ClientIP = clientIP
+			resp, _ := s.core.Process(ctx, msg, meta)
+			return resp
+		})
 	}
 }
 
@@ -519,32 +355,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // --- helpers ---
-
-// resolveTenant maps an SNI/host to a tenant: customer custom main domain
-// first (exact or any subdomain), then <prefix>.<base_domain> prefix routing.
-func (s *Server) resolveTenant(ctx context.Context, host string) (*model.Tenant, string) {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return nil, ""
-	}
-	if t, err := s.core.repos.TenantByDomain(ctx, host); err == nil && t != nil {
-		return t, "domain"
-	}
-	prefix := prefixFromSNI(host, s.cfg.BaseDomain)
-	if prefix != "" {
-		if t, err := s.core.repos.TenantByPrefix(ctx, prefix); err == nil && t != nil {
-			return t, "prefix"
-		}
-	}
-	return nil, ""
-}
-
-// RefreshCerts rescans the per-domain certificate directory (called on config
-// reload and periodically so newly issued certs are picked up without a
-// restart).
-func (s *Server) RefreshCerts() {
-	s.certStore.Reload()
-}
 
 // prefixFromSNI extracts a single-label tenant prefix from "prefix.base".
 func prefixFromSNI(sni, baseDomain string) string {

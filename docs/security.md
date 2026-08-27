@@ -1,6 +1,6 @@
 # 安全设计
 
-目标：**为安全而生**，并为政企客户提供**高价值专用通道**。
+目标：**不保留任何已知高危漏洞**，并为政企客户提供**高价值专用通道**。
 
 ## 1. 威胁模型
 
@@ -65,3 +65,55 @@ VIP 租户（`tenants.vip=1`）自动获得：
   `verify` 模式做 RRSIG 本地校验，但完整信任链验证建议依赖验证型上游
 - DoH 客户端真实 IP 依赖同机 nginx 设置的 `X-Real-IP`（部署模板已配置，注意勿暴露 API 直连）
 - Redis/MySQL 本身的访问控制（ACL/TLS/防火墙）属于部署基线，见部署文档
+
+
+## 等保合规(等保二级/三级对照)
+
+### 三员分立(等保三级硬性要求)
+| 角色 | 职责 | 权限范围 |
+|---|---|---|
+| sysadmin 系统管理员 | 业务配置管理 | 租户/上游/规则/热域/缓存/用户账号管理 |
+| secadmin 安全管理员 | 安全管控 | 账号锁定/解锁/强制下线/安全概览 |
+| auditadmin 审计管理员 | 审计独立 | 仅审计日志查看/导出/哈希链校验 |
+| tenant 租户 | 客户自助 | 仅本租户资源与查询日志 |
+
+- `admin`(旧超管)由 `requireRole` 内部兼容为 sysadmin,新建账号不再允许 admin
+- 三权互相独立: sysadmin 不能删审计日志; auditadmin 不能改配置; secadmin 不能管业务
+- 所有管理端点按角色白名单强制校验,越权返回 403
+
+### 审计日志防篡改(哈希链)
+- `audit_logs` 表为只追加(应用层), 每条记录包含:
+  - `prev_hash`: 上一条的 entry_hash(首条为 genesis)
+  - `entry_hash`: SHA-256(prev_hash|ts|actor|action|target|detail|ip|verifier)
+- 写入使用事务 + `FOR UPDATE` 锁保证并发下链不分支
+- 校验端点: `GET /api/v1/logs/audit/verify`(auditadmin)返回链完整性 + 断点 ID
+- 任何中间篡改会导致后续全部 entry_hash 失配, 可精确定位被改的第一条
+
+### 密码策略(等保二级/三级)
+- 复杂度: 长度 >= 10, 必须含大小写字母+数字+特殊字符, 禁止含用户名
+- 历史密码: 最近 5 次不可复用(password_history 表)
+- 强制改密: 新账号 must_change_pwd=1, 首次登录后必须改密
+- 登录锁定: 连续 5 次失败锁定 15 分钟; 每 IP 限速(默认 10 次/10 分钟)
+- 改密后自动吊销其它会话
+
+### 会话管理
+- Access Token 15 分钟 + Refresh Token 单次使用(Redis 存储, 可吊销)
+- secadmin 可强制下线任意账号(吊销全部 refresh token)
+- 登出时 access token 加入黑名单至自然过期
+
+### 操作快照(等保三级)
+- 关键配置变更(租户/上游/规则)审计 detail 记录 before/after 完整状态
+- 审计含 actor/action/target/ip/时间, 全链路可追溯
+
+### 安全告警(安全管理中心)
+- 配置 `SECURITY_ALERT_WEBHOOK`(钉钉/企微)后, 连续失败达阈值实时推送
+- 支持钉钉加签(SECURITY_ALERT_TOKEN), 同目标 15 分钟冷却防刷屏
+
+### 日志留存与备份(等保二级 >=6 个月, 三级 >=12 个月)
+- query_logs 建议按天 RANGE 分区归档, 至少保留 6 个月(建议 12 个月)
+- audit_logs 建议永久保留或 >=12 个月(哈希链可验证完整性)
+- 备份策略:
+  - MariaDB: 每日全量 + binlog 增量, RPO <= 24h, RTO <= 4h
+  - Redis: RDB/AOF 持久化 + 每日快照
+  - 恢复演练: 每季度一次, 备份文件加密存储异地
+- 运维脚本: `scripts/backup-mariadb.sh` / `scripts/backup-redis.sh`

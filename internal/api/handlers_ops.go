@@ -1,10 +1,6 @@
 package api
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"net"
 	"net/http"
 
 	"dns-platform/internal/model"
@@ -63,27 +59,6 @@ func (a *API) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-// rejectInternalUpstream blocks upstream addresses that point at internal
-// or cloud-metadata networks (SSRF guard). Hostnames are allowed (they are
-// resolved by the platform at runtime), IP literals are validated.
-func rejectInternalUpstream(u *model.Upstream) error {
-	ip := net.ParseIP(u.Address)
-	if ip == nil {
-		// not an IP literal ? allow (hostname)
-		return nil
-	}
-	// Alibaba / AWS / GCP metadata endpoints
-	for _, m := range []string{"100.100.100.200", "169.254.169.254"} {
-		if u.Address == m {
-			return errors.New("upstream address targets metadata service (blocked)")
-		}
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-		return errors.New("upstream address must be a public IP (blocked internal address)")
-	}
-	return nil
-}
-
 func (a *API) createUpstream(w http.ResponseWriter, r *http.Request) {
 	var u model.Upstream
 	if err := readJSON(w, r, &u); err != nil {
@@ -92,10 +67,6 @@ func (a *API) createUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.Protocol == "" || u.Address == "" || u.GroupID == "" {
 		writeErr(w, http.StatusBadRequest, "protocol, address and group_id required")
-		return
-	}
-	if err := rejectInternalUpstream(&u); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if u.TLSInsecure && a.cfg.Env == "prod" {
@@ -117,19 +88,17 @@ func (a *API) updateUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.ID = r.PathValue("id")
-	if err := rejectInternalUpstream(&u); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	if u.TLSInsecure && a.cfg.Env == "prod" {
 		writeErr(w, http.StatusBadRequest, "tls_insecure is forbidden in prod")
 		return
 	}
+	// 等保: 操作快照 - 更新前记录旧值
+	old, _ := a.repos.GetUpstream(r.Context(), u.ID)
 	if err := a.repos.UpdateUpstream(r.Context(), &u); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.afterConfigChange(r, "upstream.update", u.ID)
+	a.afterConfigChangeSnap(r, "upstream.update", u.ID, old, &u)
 	writeJSON(w, http.StatusOK, u)
 }
 
@@ -200,23 +169,24 @@ func (a *API) reload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.bumpConfig(r.Context())
 	a.auditAction(r, "config.reload", "all", "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
-}
-
-// bumpConfig signals the data plane (dnsd) to hot-reload configuration.
-func (a *API) bumpConfig(ctx context.Context) {
-	if a.rdb != nil {
-		_ = a.rdb.Incr(ctx, "dns:config:version").Err()
-	}
 }
 
 func (a *API) afterConfigChange(r *http.Request, action, target string) {
 	// data plane reload + audit in one step
 	_ = a.core.ReloadAll(r.Context())
-	a.bumpConfig(r.Context())
 	a.auditAction(r, action, target, "")
+}
+
+// afterConfigChangeSnap 与 afterConfigChange 相同, 但审计 detail 带 before/after 操作快照
+// (等保三级: 操作可追溯性 - 记录操作前后关键数据状态)
+func (a *API) afterConfigChangeSnap(r *http.Request, action, target string, before, after any) {
+	_ = a.core.ReloadAll(r.Context())
+	a.auditAction(r, action, target, map[string]any{
+		"before": before,
+		"after":  after,
+	})
 }
 
 // --- hot domains ---
@@ -260,39 +230,17 @@ func (a *API) deleteHotDomain(w http.ResponseWriter, r *http.Request) {
 // --- stats ---
 
 func (a *API) statsOverview(w http.ResponseWriter, r *http.Request) {
-	// Prefer live stats pushed by the data plane (dnsd) via Redis.
-	if a.rdb != nil {
-		if raw, err := a.rdb.Get(r.Context(), "dns:stats:overview").Result(); err == nil && raw != "" {
-			var m map[string]any
-			if json.Unmarshal([]byte(raw), &m) == nil {
-				c := claimsFrom(r)
-				if c != nil && c.Role == string(model.RoleTenant) {
-					m["tenant_queries"] = a.core.TenantQueries(c.TID)
-				}
-				writeJSON(w, http.StatusOK, m)
-				return
-			}
-		}
-	}
 	qps, hitRate, errRate := a.core.Stats().Snapshot()
 	tq, th, te := a.core.Stats().Totals()
-	hitTotal := 0.0
-	errTotal := 0.0
-	if tq > 0 {
-		hitTotal = float64(th) / float64(tq) * 100.0
-		errTotal = float64(te) / float64(tq) * 100.0
-	}
 	c := claimsFrom(r)
 	resp := map[string]any{
-		"instance_id":          a.cfg.InstanceID,
-		"qps":                  round2(qps),
-		"hit_rate_pct":         round2(hitRate),
-		"error_rate_pct":       round2(errRate),
-		"hit_rate_total_pct":   round2(hitTotal),
-		"error_rate_total_pct": round2(errTotal),
-		"total_queries":        tq,
-		"total_hits":           th,
-		"total_errors":         te,
+		"instance_id":    a.cfg.InstanceID,
+		"qps":            round2(qps),
+		"hit_rate_pct":   round2(hitRate),
+		"error_rate_pct": round2(errRate),
+		"total_queries":  tq,
+		"total_hits":     th,
+		"total_errors":   te,
 	}
 	if c != nil && c.Role == string(model.RoleTenant) {
 		resp["tenant_queries"] = a.core.TenantQueries(c.TID)

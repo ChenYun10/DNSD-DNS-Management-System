@@ -19,9 +19,7 @@ import (
 
 // WarmupManager implements 动态预热:
 //  1. Active-ECS tracking — every query records its ECS into a Redis set
-//     per tenant, so we always know which subnets are "live". The tracking
-//     writes are batched (channel + flusher) so the request hot path never
-//     pays a Redis round-trip for SADD/EXPIRE.
+//     per tenant, so we always know which subnets are "live".
 //  2. On-demand warming (API): warm(domains × active ECS) through the real
 //     upstream pipeline, writing results into the Redis cache.
 //  3. Adaptive warming (cache layer): hot entries near expiry are refreshed
@@ -33,15 +31,6 @@ type WarmupManager struct {
 
 	mu   sync.Mutex
 	jobs map[string]*WarmJob
-
-	ecsCh    chan ecsTrack
-	stopCh   chan struct{}
-	stopOnce sync.Once
-}
-
-type ecsTrack struct {
-	tenantID string
-	ecs      string
 }
 
 type WarmJob struct {
@@ -58,85 +47,17 @@ type WarmJob struct {
 }
 
 func NewWarmupManager(cfg *config.Config, rdb *redis.Client, core *Core) *WarmupManager {
-	return &WarmupManager{
-		cfg: cfg, rdb: rdb, core: core, jobs: make(map[string]*WarmJob),
-		ecsCh:  make(chan ecsTrack, 8192),
-		stopCh: make(chan struct{}),
-	}
+	return &WarmupManager{cfg: cfg, rdb: rdb, core: core, jobs: make(map[string]*WarmJob)}
 }
 
-// Start launches the batched ECS-tracking flusher.
-func (w *WarmupManager) Start() {
-	go w.ecsFlusher()
-}
-
-// Stop flushes pending ECS tracking and stops the flusher goroutine.
-func (w *WarmupManager) Stop() {
-	w.stopOnce.Do(func() { close(w.stopCh) })
-}
-
-// TrackActiveECS records the ECS subnet seen for a tenant. It is called on
-// every query but only does a non-blocking channel send; the flusher batches
-// SADD+EXPIRE into Redis pipelines. Drops silently when the buffer is full.
+// TrackActiveECS records the ECS subnet seen for a tenant (used to target
+// pre-warming at live subnets only).
 func (w *WarmupManager) TrackActiveECS(ctx context.Context, tenantID, ecs string) {
-	if w.rdb == nil || tenantID == "" || ecs == "" {
+	if tenantID == "" || ecs == "" || w.rdb == nil {
 		return
 	}
-	select {
-	case w.ecsCh <- ecsTrack{tenantID: tenantID, ecs: ecs}:
-	default: // buffer full — drop; next tracking round will re-add
-	}
-}
-
-// ecsFlusher drains the tracking channel in batches: one Redis Pipeline per
-// flush, so N queries cost ~1 round-trip per 2s instead of 2 per query.
-func (w *WarmupManager) ecsFlusher() {
-	pending := map[string]map[string]bool{} // tenantID -> set(ecs)
-	count := func() int {
-		n := 0
-		for _, s := range pending {
-			n += len(s)
-		}
-		return n
-	}
-	flush := func() {
-		if len(pending) == 0 {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		pipe := w.rdb.Pipeline()
-		for tid, ecss := range pending {
-			key := store.ECSActiveSetKey(tid)
-			args := make([]any, 0, len(ecss))
-			for e := range ecss {
-				args = append(args, e)
-			}
-			pipe.SAdd(ctx, key, args...)
-			pipe.Expire(ctx, key, 7*24*time.Hour)
-		}
-		pipe.Exec(ctx)
-		pending = map[string]map[string]bool{}
-	}
-	t := time.NewTicker(2 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case tr := <-w.ecsCh:
-			if pending[tr.tenantID] == nil {
-				pending[tr.tenantID] = map[string]bool{}
-			}
-			pending[tr.tenantID][tr.ecs] = true
-			if count() >= 500 {
-				flush()
-			}
-		case <-t.C:
-			flush()
-		case <-w.stopCh:
-			flush()
-			return
-		}
-	}
+	w.rdb.SAdd(ctx, store.ECSActiveSetKey(tenantID), ecs)
+	w.rdb.Expire(ctx, store.ECSActiveSetKey(tenantID), 7*24*time.Hour)
 }
 
 // ActiveECS returns the recently-seen subnets for a tenant.
@@ -255,15 +176,13 @@ func (w *WarmupManager) Jobs() []*WarmJob {
 }
 
 // isHotDomain reports whether a qname belongs to the tenant's hot list
-// (used by adaptive warming).
-//
-// Deprecated: replaced by Core.isHotDomainLocal (in-memory hot set, no Redis
-// round-trip per query). Kept as a pure helper for reference.
+// (used by adaptive warming). Loaded from Redis hash maintained by Core.
 func isHotDomain(rdb *redis.Client, tenantID, qname string) bool {
 	if rdb == nil {
 		return false
 	}
 	q := strings.ToLower(strings.TrimSuffix(qname, "."))
+	// exact match first, then longest-suffix match
 	ok, err := rdb.SIsMember(context.Background(), "dns:hot:"+store.Safe(tenantID), q).Result()
 	if err == nil && ok {
 		return true

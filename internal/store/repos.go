@@ -42,14 +42,16 @@ func CheckPassword(hash, pw string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
 }
 
-var userCols = "id, tenant_id, username, password_hash, role, email, failed_attempts, locked_until, last_login, created_at"
+var userCols = "id, tenant_id, username, password_hash, role, email, failed_attempts, locked_until, last_login, must_change_pwd, pwd_changed_at, created_at"
 
 func scanUser(row *sql.Row) (*model.User, error) {
 	u := &model.User{}
 	var tid, email sql.NullString
 	var fa sql.NullInt64
 	var lu, ll sql.NullTime
-	err := row.Scan(&u.ID, &tid, &u.Username, &u.PasswordHash, &u.Role, &email, &fa, &lu, &ll, &u.CreatedAt)
+	var mcp sql.NullBool
+	var pca sql.NullTime
+	err := row.Scan(&u.ID, &tid, &u.Username, &u.PasswordHash, &u.Role, &email, &fa, &lu, &ll, &mcp, &pca, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -61,6 +63,10 @@ func scanUser(row *sql.Row) (*model.User, error) {
 	}
 	if ll.Valid {
 		u.LastLogin = ll.Time
+	}
+	u.MustChangePwd = mcp.Bool
+	if pca.Valid {
+		u.PwdChangedAt = pca.Time
 	}
 	return u, nil
 }
@@ -91,9 +97,17 @@ func (r *Repos) CreateUser(ctx context.Context, u *model.User, plainPassword str
 	if err != nil {
 		return err
 	}
+	now := time.Now()
 	_, err = r.db.ExecContext(ctx,
-		"INSERT INTO users (id, tenant_id, username, password_hash, role, email, created_at) VALUES (?,?,?,?,?,?,?)",
-		u.ID, nullStr(u.TenantID), u.Username, hash, u.Role, nullStr(u.Email), time.Now())
+		"INSERT INTO users (id, tenant_id, username, password_hash, role, email, must_change_pwd, pwd_changed_at, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+		u.ID, nullStr(u.TenantID), u.Username, hash, u.Role, nullStr(u.Email), u.MustChangePwd, now, now)
+	if err != nil {
+		return err
+	}
+	// 记录初始密码到历史(等保: 密码不可复用)
+	_, err = r.db.ExecContext(ctx,
+		"INSERT INTO password_history (user_id, password_hash, created_at) VALUES (?,?,?)",
+		u.ID, hash, now)
 	return err
 }
 
@@ -102,7 +116,57 @@ func (r *Repos) SetPassword(ctx context.Context, userID, plainPassword string) e
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(ctx, "UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?", hash, userID)
+	now := time.Now()
+	_, err = r.db.ExecContext(ctx,
+		"UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL, must_change_pwd = 0, pwd_changed_at = ? WHERE id = ?",
+		hash, now, userID)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx,
+		"INSERT INTO password_history (user_id, password_hash, created_at) VALUES (?,?,?)",
+		userID, hash, now)
+	return err
+}
+
+// CheckPasswordHistory 检查新密码是否与最近 N 次历史密码重复(等保: 密码不可复用)
+func (r *Repos) CheckPasswordHistory(ctx context.Context, userID, plainPassword string, historyCount int) (bool, error) {
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT password_hash FROM password_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", userID, historyCount)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return false, err
+		}
+		if CheckPassword(h, plainPassword) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// RevokeAllSessions 强制下线: 删除用户所有 refresh token(等保: 会话吊销)
+func (r *Repos) RevokeAllSessions(ctx context.Context, userID string, rdb *redis.Client) error {
+	// 通过 Redis 全量扫描 key 前缀 dns:refresh:* 删除该用户的令牌
+	iter := rdb.Scan(ctx, 0, "dns:refresh:*", 500).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		if v, err := rdb.Get(ctx, key).Result(); err == nil && v == userID {
+			rdb.Del(ctx, key)
+		}
+	}
+	return iter.Err()
+}
+
+// UpdateUser updates the tenant binding / role / email of a user.
+func (r *Repos) UpdateUser(ctx context.Context, u *model.User) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE users SET tenant_id = ?, role = ?, email = ? WHERE id = ?",
+		nullStr(u.TenantID), u.Role, nullStr(u.Email), u.ID)
 	return err
 }
 
@@ -118,14 +182,6 @@ func (r *Repos) RecordLoginSuccess(ctx context.Context, userID string) error {
 	return err
 }
 
-// UpdateUser updates a user's role, tenant binding and email.
-func (r *Repos) UpdateUser(ctx context.Context, id, role, tenantID, email string) error {
-	_, err := r.db.ExecContext(ctx,
-		"UPDATE users SET role = ?, tenant_id = NULLIF(?, ''), email = NULLIF(?, '') WHERE id = ?",
-		role, tenantID, email, id)
-	return err
-}
-
 func (r *Repos) ListUsers(ctx context.Context) ([]*model.User, error) {
 	rows, err := r.db.QueryContext(ctx, "SELECT "+userCols+" FROM users ORDER BY created_at DESC")
 	if err != nil {
@@ -138,7 +194,9 @@ func (r *Repos) ListUsers(ctx context.Context) ([]*model.User, error) {
 		var tid, email sql.NullString
 		var fa sql.NullInt64
 		var lu, ll sql.NullTime
-		if err := rows.Scan(&u.ID, &tid, &u.Username, &u.PasswordHash, &u.Role, &email, &fa, &lu, &ll, &u.CreatedAt); err != nil {
+		var mcp sql.NullBool
+		var pca sql.NullTime
+		if err := rows.Scan(&u.ID, &tid, &u.Username, &u.PasswordHash, &u.Role, &email, &fa, &lu, &ll, &mcp, &pca, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		u.TenantID = tid.String
@@ -149,6 +207,10 @@ func (r *Repos) ListUsers(ctx context.Context) ([]*model.User, error) {
 		}
 		if ll.Valid {
 			u.LastLogin = ll.Time
+		}
+		u.MustChangePwd = mcp.Bool
+		if pca.Valid {
+			u.PwdChangedAt = pca.Time
 		}
 		u.PasswordHash = ""
 		out = append(out, &u)
@@ -573,4 +635,104 @@ func (r *Repos) PurgeMetaCache(ctx context.Context) {
 func AuditDetail(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// LockUser 人工锁定账号(等保: 安全管理员管控)
+func (r *Repos) LockUser(ctx context.Context, userID string, dur time.Duration) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE users SET locked_until = ?, failed_attempts = 0 WHERE id = ?",
+		time.Now().Add(dur), userID)
+	return err
+}
+
+// UnlockUser 人工解锁账号
+func (r *Repos) UnlockUser(ctx context.Context, userID string) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE users SET locked_until = NULL, failed_attempts = 0 WHERE id = ?", userID)
+	return err
+}
+
+// CountLockedUsers 统计当前锁定账号数
+func (r *Repos) CountLockedUsers(ctx context.Context) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM users WHERE locked_until IS NOT NULL AND locked_until > NOW()").Scan(&n)
+	return n, err
+}
+
+// CountMustChangePwd 统计待强制改密账号数(等保: 密码定期更换)
+func (r *Repos) CountMustChangePwd(ctx context.Context) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM users WHERE must_change_pwd = 1").Scan(&n)
+	return n, err
+}
+
+// RecentLoginFailures 最近登录失败记录(安全概览用)
+func (r *Repos) RecentLoginFailures(ctx context.Context, limit int) ([]map[string]any, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT actor_name, action, ts, client_ip FROM audit_logs
+		 WHERE action = 'auth.login_failed'
+		 ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var name, action, ip sql.NullString
+		var ts time.Time
+		if err := rows.Scan(&name, &action, &ts, &ip); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"username":  name.String,
+			"action":    action.String,
+			"ts":        ts,
+			"client_ip": ip.String,
+		})
+	}
+	return out, rows.Err()
+}
+
+// GetAuditLastHash 获取最后一条审计日志哈希(供校验/续链)
+func (r *Repos) GetAuditLastHash(ctx context.Context) (string, error) {
+	var h sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		"SELECT entry_hash FROM audit_logs ORDER BY id DESC LIMIT 1").Scan(&h)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return h.String, nil
+}
+
+// GetUpstream 按 ID 获取单个上游(操作快照用)
+func (r *Repos) GetUpstream(ctx context.Context, id string) (*model.Upstream, error) {
+	us, err := r.ListUpstreams(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range us {
+		if u.ID == id {
+			return u, nil
+		}
+	}
+	return nil, nil
+}
+
+// GetRule 按 ID 获取单个分流规则(操作快照用)
+func (r *Repos) GetRule(ctx context.Context, id string) (*model.SplitRule, error) {
+	rs, err := r.ListRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range rs {
+		if s.ID == id {
+			return s, nil
+		}
+	}
+	return nil, nil
 }

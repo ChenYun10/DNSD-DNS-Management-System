@@ -76,16 +76,20 @@ func (a *API) createTenant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// default: tenant admin user with same name
+	// default: tenant admin user with same name（初始密码一次性返回，仅创建时可见）
+	initPass := randomPassword()
 	_ = a.repos.CreateUser(r.Context(), &model.User{
 		ID:       uuid.NewString(),
 		TenantID: t.ID,
 		Username: t.Name + "-admin",
 		Role:     model.RoleTenant,
-	}, randomPassword())
-	a.bumpConfig(r.Context())
+	}, initPass)
 	a.auditAction(r, "tenant.create", "tenant:"+t.ID, t)
-	writeJSON(w, http.StatusCreated, t)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"tenant":           t,
+		"initial_username": t.Name + "-admin",
+		"initial_password": initPass, // 仅此一次返回，请立即告知租户并建议登录后修改
+	})
 }
 
 func (a *API) updateTenant(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +99,8 @@ func (a *API) updateTenant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "tenant not found")
 		return
 	}
+	// 等保: 操作快照 - 记录更新前的旧值
+	before := *t
 	var in model.Tenant
 	if err := readJSON(w, r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
@@ -103,7 +109,8 @@ func (a *API) updateTenant(w http.ResponseWriter, r *http.Request) {
 	// tenant users may only toggle their own protocol flags; prefix changes
 	// go through /dot (audited separately)
 	c := claimsFrom(r)
-	if c.Role != string(model.RoleAdmin) {
+	isSysAdmin := c.Role == string(model.RoleAdmin) || c.Role == string(model.RoleSysAdmin)
+	if !isSysAdmin {
 		t.DoTEnabled = in.DoTEnabled
 		t.DoHEnabled = in.DoHEnabled
 		t.DoQEnabled = in.DoQEnabled
@@ -127,8 +134,8 @@ func (a *API) updateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.repos.PurgeMetaCache(r.Context())
-	a.bumpConfig(r.Context())
-	a.auditAction(r, "tenant.update", "tenant:"+id, t)
+	// 等保三级: 操作快照 before/after
+	a.auditAction(r, "tenant.update", "tenant:"+id, map[string]any{"before": before, "after": t})
 	writeJSON(w, http.StatusOK, t)
 }
 
@@ -139,7 +146,6 @@ func (a *API) deleteTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.repos.PurgeMetaCache(r.Context())
-	a.bumpConfig(r.Context())
 	a.auditAction(r, "tenant.delete", "tenant:"+id, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -376,28 +382,94 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if in.Username == "" || len(in.Password) < 12 {
-		writeErr(w, http.StatusBadRequest, "username required; password >= 12 chars")
+	if strings.TrimSpace(in.Username) == "" {
+		writeErr(w, http.StatusBadRequest, "用户名不能为空")
 		return
 	}
+	// 等保: 密码复杂度策略(前端+后端双重校验)
+	if msg := ValidatePasswordStrength(in.Username, in.Password); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	if in.TenantID != "" {
+		if t, err := a.repos.GetTenant(r.Context(), in.TenantID); err != nil || t == nil {
+			writeErr(w, http.StatusBadRequest, "租户不存在")
+			return
+		}
+	}
 	role := model.Role(in.Role)
-	if role != model.RoleAdmin && role != model.RoleTenant {
+	// 等保三员: 允许 sysadmin/secadmin/auditadmin/tenant; admin 仅限首个引导账号
+	switch role {
+	case model.RoleSysAdmin, model.RoleSecAdmin, model.RoleAuditAdmin, model.RoleTenant:
+	case model.RoleAdmin:
+		role = model.RoleSysAdmin // 新建账号不再允许 admin, 统一为 sysadmin
+	default:
 		role = model.RoleTenant
 	}
 	u := &model.User{
-		ID:       uuid.NewString(),
-		TenantID: in.TenantID,
-		Username: strings.ToLower(in.Username),
-		Role:     role,
-		Email:    in.Email,
+		ID:             uuid.NewString(),
+		TenantID:       in.TenantID, // admin 也可绑定租户作为归属
+		Username:       strings.ToLower(strings.TrimSpace(in.Username)),
+		Role:           role,
+		Email:          in.Email,
+		MustChangePwd:  true, // 等保: 新账号首次登录强制改密
 	}
 	if err := a.repos.CreateUser(r.Context(), u, in.Password); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	u.PasswordHash = ""
-	a.auditAction(r, "user.create", "user:"+u.Username, "")
+	a.auditAction(r, "user.create", "user:"+u.Username, map[string]any{"tenant_id": in.TenantID})
 	writeJSON(w, http.StatusCreated, u)
+}
+
+// updateUser 修改用户：绑定/改绑租户、角色、邮箱（admin）
+func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	u, err := a.repos.GetUserByID(r.Context(), id)
+	if err != nil || u == nil {
+		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	var in struct {
+		TenantID *string `json:"tenant_id"`
+		Role     string  `json:"role"`
+		Email    string  `json:"email"`
+	}
+	if err := readJSON(w, r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if in.Role != "" {
+		role := model.Role(in.Role)
+		switch role {
+		case model.RoleSysAdmin, model.RoleSecAdmin, model.RoleAuditAdmin, model.RoleTenant:
+			u.Role = role
+		case model.RoleAdmin:
+			u.Role = model.RoleSysAdmin // 等保: 不再允许 admin 角色, 统一 sysadmin
+		default:
+			writeErr(w, http.StatusBadRequest, "invalid role")
+			return
+		}
+	}
+	if in.TenantID != nil {
+		tid := *in.TenantID
+		if tid != "" {
+			if t, err := a.repos.GetTenant(r.Context(), tid); err != nil || t == nil {
+				writeErr(w, http.StatusBadRequest, "租户不存在")
+				return
+			}
+		}
+		u.TenantID = tid // admin 也可绑定租户作为归属/默认视角（admin 权限不受限）
+	}
+	u.Email = in.Email
+	if err := a.repos.UpdateUser(r.Context(), u); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	u.PasswordHash = ""
+	a.auditAction(r, "user.update", "user:"+u.Username, map[string]any{"tenant_id": u.TenantID, "role": u.Role})
+	writeJSON(w, http.StatusOK, u)
 }
 
 func (a *API) setPassword(w http.ResponseWriter, r *http.Request) {
@@ -408,56 +480,29 @@ func (a *API) setPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if len(in.Password) < 12 {
-		writeErr(w, http.StatusBadRequest, "password must be >= 12 chars")
+	// 等保: 密码复杂度
+	if msg := ValidatePasswordStrength("", in.Password); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
-	if err := a.repos.SetPassword(r.Context(), r.PathValue("id"), in.Password); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	a.auditAction(r, "user.password_reset", "user:"+r.PathValue("id"), "")
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// updateUser edits a user's role, tenant binding and email (admin only).
-func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var in struct {
-		Role     string `json:"role"`
-		TenantID string `json:"tenant_id"`
-		Email    string `json:"email"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	u, err := a.repos.GetUserByID(r.Context(), id)
+	uid := r.PathValue("id")
+	// 等保: 密码不可复用(最近 5 次历史密码)
+	reused, err := a.repos.CheckPasswordHistory(r.Context(), uid, in.Password, 5)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "user not found")
-		return
-	}
-	role := string(u.Role)
-	if in.Role != "" {
-		if in.Role != string(model.RoleAdmin) && in.Role != string(model.RoleTenant) {
-			writeErr(w, http.StatusBadRequest, "invalid role")
-			return
-		}
-		role = in.Role
-	}
-	tenantID := u.TenantID
-	if in.TenantID != "" {
-		tenantID = in.TenantID
-	}
-	if role == string(model.RoleTenant) && tenantID == "" {
-		writeErr(w, http.StatusBadRequest, "tenant user must be bound to a tenant")
-		return
-	}
-	if err := a.repos.UpdateUser(r.Context(), id, role, tenantID, in.Email); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.auditAction(r, "user.update", "user:"+id, "")
+	if reused {
+		writeErr(w, http.StatusBadRequest, "password was used recently, choose a new one")
+		return
+	}
+	if err := a.repos.SetPassword(r.Context(), uid, in.Password); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 改密后吊销其它会话(等保: 改密强制下线)
+	_ = a.repos.RevokeAllSessions(r.Context(), uid, a.rdb)
+	a.auditAction(r, "user.password_reset", "user:"+r.PathValue("id"), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

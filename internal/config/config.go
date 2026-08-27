@@ -81,6 +81,16 @@ type Config struct {
 	APIJWTSecret   string // HMAC secret, min 32 chars
 	JWTExpiry      time.Duration
 	JWTRefreshExp  time.Duration
+
+	// 服务器运营模式: admin 拥有全部审计日志查看权(生产运维需求)
+	// GitHub 开源版保持三权分立(auditadmin 专属), 此开关默认 false
+	AdminFullAudit bool
+
+	// 等保: 安全告警(异常登录/权限变更实时通知)
+	SecurityAlertWebhook string // 钉钉/企微/通用 webhook URL, 空=禁用
+	SecurityAlertToken   string // 钉钉加签 secret(可选)
+	SecurityAlertMinFails int // 连续失败 N 次触发告警
+	SecurityAlertCooldown time.Duration // 同目标告警冷却
 	APICORSOrigins []string
 
 	// Warmup
@@ -90,19 +100,6 @@ type Config struct {
 	// POST /api/v1/bootstrap/admin endpoint can create the initial admin
 	// account. The endpoint disables itself once an admin exists.
 	BootstrapToken string
-
-	// Admin-managed SSL (ACME). Tenant custom main domains get certificates
-	// issued/renewed automatically from the backend; the base wildcard cert
-	// stays with the existing acme.sh flow (renew-dns-cert.sh).
-	ACMEEnabled           bool          // master switch for the ACME manager
-	ACMEEmail             string        // contact email for the CA
-	ACMEStaging           bool          // use Let's Encrypt staging (avoid rate limits while testing)
-	ACMEDirectoryURL      string        // explicit CA directory override
-	CertDir               string        // cert root: {CertDir}/domains/<domain>/{fullchain.pem,privkey.pem}
-	ACMEHTTPPort          string        // HTTP-01 challenge listener, e.g. 127.0.0.1:5002 (behind nginx)
-	AliyunAccessKeyID     string        // for DNS-01 issuance on Aliyun-hosted domains
-	AliyunAccessKeySecret string
-	CertRenewBefore       time.Duration // renew when expiry is closer than this
 }
 
 // Load reads configuration from the environment. If path is non-empty and the
@@ -154,18 +151,14 @@ func Load(envFile string) (*Config, error) {
 		APIJWTSecret:          getenv("API_JWT_SECRET", ""),
 		JWTExpiry:             getdur("JWT_EXPIRY", 15*time.Minute),
 		JWTRefreshExp:         getdur("JWT_REFRESH_EXPIRY", 7*24*time.Hour),
+		AdminFullAudit:        getenv("ADMIN_FULL_AUDIT", "") == "true",
+		SecurityAlertWebhook:  getenv("SECURITY_ALERT_WEBHOOK", ""),
+		SecurityAlertToken:    getenv("SECURITY_ALERT_TOKEN", ""),
+		SecurityAlertMinFails: getint("SECURITY_ALERT_MIN_FAILS", 5),
+		SecurityAlertCooldown: getdur("SECURITY_ALERT_COOLDOWN", 15*time.Minute),
 		APICORSOrigins:        splitCSV(getenv("API_CORS_ORIGINS", "http://localhost:8081,http://127.0.0.1:8081")),
 		WarmupConcurrency:     getint("WARMUP_CONCURRENCY", 32),
 		BootstrapToken:        getenv("BOOTSTRAP_TOKEN", ""),
-		ACMEEnabled:           getbool("ACME_ENABLED", false),
-		ACMEEmail:             getenv("ACME_EMAIL", ""),
-		ACMEStaging:           getbool("ACME_STAGING", false),
-		ACMEDirectoryURL:      getenv("ACME_DIRECTORY_URL", ""),
-		CertDir:               getenv("CERT_DIR", "/etc/dns-platform/certs"),
-		ACMEHTTPPort:          getenv("ACME_HTTP_PORT", "127.0.0.1:5002"),
-		AliyunAccessKeyID:     getenv("ALIYUN_ACCESS_KEY_ID", ""),
-		AliyunAccessKeySecret: getenv("ALIYUN_ACCESS_KEY_SECRET", ""),
-		CertRenewBefore:       getdur("CERT_RENEW_BEFORE", 720*time.Hour),
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

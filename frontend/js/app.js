@@ -7,13 +7,29 @@ async function loadMe() {
   return ME;
 }
 
+const ROLE_LABELS = { 'admin': '平台管理员', 'sysadmin': '系统管理员', 'secadmin': '安全管理员', 'auditadmin': '审计管理员', 'tenant': '租户用户' };
+// 管理角色集合(非租户)
+const isAdminRole = r => r && r !== 'tenant';
+// 三权分立: 各管理角色可访问的管理视图
+const roleCanView = (role, view) => {
+  if (!role) return false;
+  if (role === 'tenant') return view === 'logs'; // 租户只能看日志
+  if (role === 'auditadmin') return view === 'logs' || view === 'security'; // 审计管理员看日志+审计
+  if (role === 'secadmin') return view === 'logs' || view === 'security'; // 安全管理员看日志+安全
+  if (role === 'admin' || role === 'sysadmin') return true; // 平台/系统管理员全看(服务器模式)
+  return false;
+};
+
 function applyIdentity() {
   const who = document.getElementById('whoami');
   if (ME) {
-    const role = ME.user.role === 'admin' ? '平台管理员' : '租户用户';
+    const role = ROLE_LABELS[ME.user.role] || ME.user.role;
     const tenantName = ME.tenant ? ME.tenant.name : '';
     who.innerHTML = '<b>' + esc(ME.user.username) + '</b><br>' + esc(role) + (tenantName ? ' · ' + esc(tenantName) : '');
-    document.querySelectorAll('.admin-only').forEach(a => a.style.display = ME.user.role === 'admin' ? '' : 'none');
+    document.querySelectorAll('.admin-only').forEach(a => {
+      const view = a.getAttribute('data-view') || '';
+      a.style.display = roleCanView(ME.user.role, view) ? '' : 'none';
+    });
   }
 }
 
@@ -33,7 +49,7 @@ async function boot() {
   if (savedBase) document.getElementById('login-api').value = savedBase;
 
   document.getElementById('login-btn').onclick = async () => {
-    const base = document.getElementById('login-api').value.trim() || (location.protocol + '//' + location.hostname + ':8001');
+    const base = document.getElementById('login-api').value.trim() || 'http://127.0.0.1:8080';
     setApiBase(base);
     const u = document.getElementById('login-user').value.trim();
     const p = document.getElementById('login-pass').value;

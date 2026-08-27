@@ -12,8 +12,8 @@ Views.dashboard = {
       get('/api/v1/me').catch(() => null)
     ]);
     const qps = stats ? stats.qps : 0;
-    const hit = stats ? (stats.hit_rate_total_pct ?? stats.hit_rate_pct) : 0;
-    const errR = stats ? (stats.error_rate_total_pct ?? stats.error_rate_pct) : 0;
+    const hit = stats ? stats.hit_rate_pct : 0;
+    const errR = stats ? stats.error_rate_pct : 0;
     const tq = stats ? stats.total_queries : 0;
     const vip = me && me.tenant && me.tenant.vip;
 
@@ -652,14 +652,14 @@ Views.users = {
   title: '用户管理',
   async render(host) {
     host.appendChild(el('div', { class: 'section-title' }, '用户管理'));
-    host.appendChild(el('div', { class: 'section-sub' }, 'bcrypt 密码存储、登录锁定、按 IP 限速；角色：admin（平台） / tenant（租户）。'));
+    host.appendChild(el('div', { class: 'section-sub' }, 'bcrypt 密码存储、登录锁定、按 IP 限速；角色（等保三员）：sysadmin 系统 / secadmin 安全 / auditadmin 审计 / tenant 租户。'));
 
     const users = await get('/api/v1/users');
     const tenants = await get('/api/v1/tenants').catch(() => []);
     const tenantName = id => { const t = tenants.find(x => x.id === id); return t ? t.name : '-'; };
     const card = el('div', { class: 'card' });
     card.insertAdjacentHTML('beforeend', table(
-      [{ t: '用户名', f: r => '<b>' + esc(r.username) + '</b>' + (r.role === 'admin' ? ' ' + badgeVip('管理员') : ' ' + badgeInfo('租户')) },
+      [{ t: '用户名', f: r => '<b>' + esc(r.username) + '</b>' + ' ' + (ROLE_BADGE[r.role] || badgeInfo(r.role || '租户')) },
        { t: '所属租户', f: r => r.tenant_id
            ? '<span class="mono">' + esc(tenantName(r.tenant_id)) + '</span> <span class="tag">' + esc(r.tenant_id.slice(0, 8)) + '</span>'
            : badgeMuted('平台（未绑定）') },
@@ -675,7 +675,7 @@ Views.users = {
       if (!u) return;
       modal('编辑用户（' + u.username + '）', [
         { key: 'role', label: '角色', type: 'select',
-          options: [['tenant', '租户用户'], ['admin', '平台管理员']], value: u.role },
+          options: [['tenant', '租户用户'], ['sysadmin', '系统管理员'], ['secadmin', '安全管理员'], ['auditadmin', '审计管理员']], value: u.role },
         { key: 'tenant_id', label: '归属租户（admin 也可绑定作默认视角；租户用户必须绑定）', type: 'select',
           options: [['', '— 不绑定（平台管理员）—']].concat(tenants.map(t => [t.id, t.name + ' (' + t.prefix + ')'])),
           value: u.tenant_id || '' },
@@ -701,7 +701,9 @@ Views.users = {
     const p = el('input', { type: 'password', placeholder: '密码（≥12位）' }); p.style.width = '180px';
     const role = el('select', {});
     role.appendChild(el('option', { value: 'tenant' }, '租户用户'));
-    role.appendChild(el('option', { value: 'admin' }, '平台管理员'));
+    role.appendChild(el('option', { value: 'sysadmin' }, '系统管理员'));
+    role.appendChild(el('option', { value: 'secadmin' }, '安全管理员'));
+    role.appendChild(el('option', { value: 'auditadmin' }, '审计管理员'));
     const tsel = el('select', {});
     tsel.appendChild(el('option', { value: '' }, '— 选择租户 —'));
     tenants.forEach(t => tsel.appendChild(el('option', { value: t.id }, t.name + ' (' + t.prefix + ')')));

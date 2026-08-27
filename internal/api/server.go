@@ -24,9 +24,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"dns-platform/internal/certmgr"
 	"dns-platform/internal/config"
 	"dns-platform/internal/dnsx"
+	"dns-platform/internal/model"
 	"dns-platform/internal/store"
 )
 
@@ -39,11 +39,10 @@ type API struct {
 	rdb     *redis.Client
 	limiter *dnsx.Limiter
 	auth    *Auth
-	certs   *certmgr.Manager
 }
 
-func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client, certs *certmgr.Manager) *API {
-	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb, certs: certs}
+func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client) *API {
+	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb}
 	a.limiter = dnsx.NewLimiter(rdb, cfg.RateLimitQPS, cfg.RateLimitVIPMult)
 	a.auth = NewAuth(cfg, repos, mysql, rdb, a.limiter)
 	return a
@@ -63,71 +62,85 @@ func (a *API) Handler() http.Handler {
 
 	// authenticated
 	mux.HandleFunc("POST /api/v1/auth/logout", a.chain(a.auth.logout, a.auth.authMiddleware))
+	mux.HandleFunc("POST /api/v1/auth/change-password", a.chain(a.auth.changePassword, a.auth.authMiddleware))
 	mux.HandleFunc("GET /api/v1/me", a.chain(a.me, a.auth.authMiddleware))
 
-	// tenants (admin CRUD; tenant role gets own tenant via /me)
-	mux.HandleFunc("GET /api/v1/tenants", a.chain(a.listTenants, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/tenants", a.chain(a.createTenant, a.auth.authMiddleware, requireAdmin))
+	// ------------------------------------------------------------------
+	// 三员分立(等保三级): sysadmin 系统管理 / secadmin 安全管理 / auditadmin 审计管理
+	// admin(旧超管)由 requireRole 内部兼容为 sysadmin
+	// ------------------------------------------------------------------
+
+	// tenants: 系统管理员(sysadmin)
+	mux.HandleFunc("GET /api/v1/tenants", a.chain(a.listTenants, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/tenants", a.chain(a.createTenant, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 	mux.HandleFunc("GET /api/v1/tenants/{id}", a.chain(a.getTenant, a.auth.authMiddleware, a.scopeTenant))
 	mux.HandleFunc("PUT /api/v1/tenants/{id}", a.chain(a.updateTenant, a.auth.authMiddleware, a.scopeTenant))
-	mux.HandleFunc("DELETE /api/v1/tenants/{id}", a.chain(a.deleteTenant, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/tenants/{id}/dot", a.chain(a.customizeDot, a.auth.authMiddleware, a.scopeTenant))         // DoT 前缀定制
-	mux.HandleFunc("GET /api/v1/tenants/{id}/endpoints", a.chain(a.tenantEndpoints, a.auth.authMiddleware, a.scopeTenant)) // DoT/DoH/DoQ 部署端点
-	mux.HandleFunc("POST /api/v1/tenants/{id}/warm", a.chain(a.warmTenant, a.auth.authMiddleware, a.scopeTenant))          // ECS 动态预热
+	mux.HandleFunc("DELETE /api/v1/tenants/{id}", a.chain(a.deleteTenant, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/tenants/{id}/dot", a.chain(a.customizeDot, a.auth.authMiddleware, a.scopeTenant))
+	mux.HandleFunc("GET /api/v1/tenants/{id}/endpoints", a.chain(a.tenantEndpoints, a.auth.authMiddleware, a.scopeTenant))
+	mux.HandleFunc("POST /api/v1/tenants/{id}/warm", a.chain(a.warmTenant, a.auth.authMiddleware, a.scopeTenant))
 	mux.HandleFunc("GET /api/v1/tenants/{id}/stats", a.chain(a.tenantStats, a.auth.authMiddleware, a.scopeTenant))
 
-	// tenant custom main domains + admin-managed SSL (客户自定义主域名 / 后台做SSL)
-	mux.HandleFunc("GET /api/v1/domains", a.chain(a.listDomains, a.auth.authMiddleware))
-	mux.HandleFunc("POST /api/v1/domains", a.chain(a.createDomain, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/domains/{id}", a.chain(a.deleteDomain, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/domains/{id}/issue", a.chain(a.issueDomainCert, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("GET /api/v1/certs", a.chain(a.certsOverview, a.auth.authMiddleware, requireAdmin))
+	// users: 系统管理员(账号生命周期归 sysadmin; 锁定/强制下线归 secadmin)
+	mux.HandleFunc("GET /api/v1/users", a.chain(a.listUsers, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/users", a.chain(a.createUser, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("PUT /api/v1/users/{id}", a.chain(a.updateUser, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/users/{id}/password", a.chain(a.setPassword, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("DELETE /api/v1/users/{id}", a.chain(a.deleteUser, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
-	// users (admin)
-	mux.HandleFunc("GET /api/v1/users", a.chain(a.listUsers, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/users", a.chain(a.createUser, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/users/{id}/password", a.chain(a.setPassword, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("PUT /api/v1/users/{id}", a.chain(a.updateUser, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/users/{id}", a.chain(a.deleteUser, a.auth.authMiddleware, requireAdmin))
+	// security: 安全管理员(secadmin) — 账号锁定/解锁/强制下线/安全概览
+	mux.HandleFunc("POST /api/v1/security/users/{id}/lock", a.chain(a.secLockUser, a.auth.authMiddleware, requireRole(model.RoleSecAdmin)))
+	mux.HandleFunc("POST /api/v1/security/users/{id}/unlock", a.chain(a.secUnlockUser, a.auth.authMiddleware, requireRole(model.RoleSecAdmin)))
+	mux.HandleFunc("POST /api/v1/security/users/{id}/revoke-sessions", a.chain(a.secRevokeSessions, a.auth.authMiddleware, requireRole(model.RoleSecAdmin)))
+	mux.HandleFunc("GET /api/v1/security/overview", a.chain(a.secOverview, a.auth.authMiddleware, requireRole(model.RoleSecAdmin)))
 
-	// upstreams / groups / split rules (admin) — 上游分流配置
-	mux.HandleFunc("GET /api/v1/groups", a.chain(a.listGroups, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/groups", a.chain(a.createGroup, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("PUT /api/v1/groups/{id}", a.chain(a.updateGroup, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/groups/{id}", a.chain(a.deleteGroup, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/upstreams", a.chain(a.createUpstream, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("PUT /api/v1/upstreams/{id}", a.chain(a.updateUpstream, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/upstreams/{id}", a.chain(a.deleteUpstream, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("GET /api/v1/rules", a.chain(a.listRules, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/rules", a.chain(a.createRule, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("PUT /api/v1/rules/{id}", a.chain(a.updateRule, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/rules/{id}", a.chain(a.deleteRule, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/reload", a.chain(a.reload, a.auth.authMiddleware, requireAdmin))
+	// upstreams / groups / split rules: 系统管理员(sysadmin)
+	mux.HandleFunc("GET /api/v1/groups", a.chain(a.listGroups, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/groups", a.chain(a.createGroup, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("PUT /api/v1/groups/{id}", a.chain(a.updateGroup, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("DELETE /api/v1/groups/{id}", a.chain(a.deleteGroup, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/upstreams", a.chain(a.createUpstream, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("PUT /api/v1/upstreams/{id}", a.chain(a.updateUpstream, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("DELETE /api/v1/upstreams/{id}", a.chain(a.deleteUpstream, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("GET /api/v1/rules", a.chain(a.listRules, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/rules", a.chain(a.createRule, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("PUT /api/v1/rules/{id}", a.chain(a.updateRule, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("DELETE /api/v1/rules/{id}", a.chain(a.deleteRule, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/reload", a.chain(a.reload, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
-	// hot domains (admin)
-	mux.HandleFunc("GET /api/v1/hot-domains", a.chain(a.listHotDomains, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/hot-domains", a.chain(a.createHotDomain, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("DELETE /api/v1/hot-domains/{id}", a.chain(a.deleteHotDomain, a.auth.authMiddleware, requireAdmin))
+	// hot domains: 系统管理员(sysadmin)
+	mux.HandleFunc("GET /api/v1/hot-domains", a.chain(a.listHotDomains, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/hot-domains", a.chain(a.createHotDomain, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("DELETE /api/v1/hot-domains/{id}", a.chain(a.deleteHotDomain, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
-	// cache management (admin)
-	mux.HandleFunc("GET /api/v1/cache/stats", a.chain(a.cacheStats, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/cache/purge", a.chain(a.cachePurge, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("POST /api/v1/cache/warm", a.chain(a.cacheWarm, a.auth.authMiddleware, requireAdmin))
-	mux.HandleFunc("GET /api/v1/cache/warm-jobs", a.chain(a.warmJobs, a.auth.authMiddleware, requireAdmin))
+	// cache management: 系统管理员(sysadmin)
+	mux.HandleFunc("GET /api/v1/cache/stats", a.chain(a.cacheStats, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/cache/purge", a.chain(a.cachePurge, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("POST /api/v1/cache/warm", a.chain(a.cacheWarm, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("GET /api/v1/cache/warm-jobs", a.chain(a.warmJobs, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
-	// ECS simulation (authenticated) — 前端 ECS 模拟
+	// ECS simulation (authenticated)
 	mux.HandleFunc("POST /api/v1/dns/simulate", a.chain(a.simulate, a.auth.authMiddleware))
 
-	// logs (admin full; tenant scoped)
+	// logs: query(租户可看自己) / audit(仅审计管理员 auditadmin)
 	mux.HandleFunc("GET /api/v1/logs/query", a.chain(a.queryLogs, a.auth.authMiddleware))
-	mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireAdmin))
+	// 审计日志: GitHub 开源版三权分立(auditadmin 专属);
+	// 服务器运营模式(ADMIN_FULL_AUDIT=true)下 admin 也可全量查看(运维需求)
+	if a.cfg.AdminFullAudit {
+		mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin, model.RoleAdmin)))
+		mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin, model.RoleAdmin)))
+	} else {
+		mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
+		mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
+	}
 
 	// stats
 	mux.HandleFunc("GET /api/v1/stats/overview", a.chain(a.statsOverview, a.auth.authMiddleware))
-	mux.HandleFunc("GET /api/v1/stats/upstreams", a.chain(a.statsUpstreams, a.auth.authMiddleware, requireAdmin))
+	mux.HandleFunc("GET /api/v1/stats/upstreams", a.chain(a.statsUpstreams, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
 	return a.middleware(mux)
 }
+
 
 // Start binds the customer API and the dedicated admin channel
 // (高价值专用通道: separate port, optional mTLS client certs).

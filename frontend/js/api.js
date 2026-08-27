@@ -1,7 +1,7 @@
 /* api.js — 与后端 REST API 通信（前后端隔离：仅通过 HTTP API + JWT） */
 
 const API_BASE_KEY = 'dns_api_base';
-let API_BASE = localStorage.getItem(API_BASE_KEY) || (location.protocol + '//' + location.hostname + ':8001');
+let API_BASE = localStorage.getItem(API_BASE_KEY) || 'http://127.0.0.1:8080';
 const TOKEN_KEY = 'dns_access_token';
 const REFRESH_KEY = 'dns_refresh_token';
 

@@ -1,12 +1,11 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"context"
 	"database/sql"
 	"log"
-	"strconv"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -150,57 +149,46 @@ func (w *QueryLogWriter) insert(rows []model.QueryLogRow) error {
 // Audit log (admin/management actions)
 // ---------------------------------------------------------------------------
 
+// auditHash 计算审计日志条目的 SHA-256 哈希(防篡改哈希链的一环)
+func auditHash(prevHash, ts, actorID, actorName, action, target, detail, clientIP, verifier string) string {
+	h := sha256.New()
+	h.Write([]byte(prevHash + "|" + ts + "|" + actorID + "|" + actorName + "|" + action + "|" + target + "|" + detail + "|" + clientIP + "|" + verifier))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (s *MySQLStore) WriteAudit(ctx context.Context, a model.AuditRow) error {
 	if a.TS.IsZero() {
 		a.TS = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_logs (ts, actor_id, actor_name, action, target, detail, client_ip) VALUES (?,?,?,?,?,?,?)`,
-		a.TS, nullStr(a.ActorID), a.ActorName, a.Action, a.Target, nullStr(a.Detail), nullStr(a.ClientIP))
-	return err
-}
-
-// countCache memoizes COUNT(*) results for a few seconds.
-// The logs page polls every few seconds; without this, each poll runs a
-// multi-million-row index scan (table grows ~8.6M rows/day) and the page
-// takes 4-8s per click. A short TTL is fine for pagination UI totals.
-type countCache struct {
-	mu sync.Mutex
-	m  map[string]cachedCount
-}
-
-type cachedCount struct {
-	total int64
-	exp   time.Time
-}
-
-var queryCountCache = &countCache{m: make(map[string]cachedCount)}
-
-func (c *countCache) get(key string) (int64, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v, ok := c.m[key]
-	if !ok || time.Now().After(v.exp) {
-		if ok {
-			delete(c.m, key)
-		}
-		return 0, false
+	// 哈希链: 读取最后一条 entry_hash 作为 prev_hash, 保证日志不可篡改(等保)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	return v.total, true
-}
+	defer tx.Rollback()
 
-func (c *countCache) put(key string, total int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m[key] = cachedCount{total: total, exp: time.Now().Add(10 * time.Second)}
-	// bound the map: opportunistically drop expired entries
-	if len(c.m) > 256 {
-		for k, v := range c.m {
-			if time.Now().After(v.exp) {
-				delete(c.m, k)
-			}
-		}
+	var prevHash sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT entry_hash FROM audit_logs ORDER BY id DESC LIMIT 1 FOR UPDATE`).Scan(&prevHash); err != nil && err != sql.ErrNoRows {
+		return err
 	}
+	ph := ""
+	if prevHash.Valid {
+		ph = prevHash.String
+	}
+	// 先截断到毫秒(与 DATETIME(3) 存储精度一致), 避免纳秒精度导致哈希不一致
+	tsMs := a.TS.UTC().Truncate(time.Millisecond)
+	tsStr := tsMs.Format("2006-01-02 15:04:05.000000")
+	verifier := "apid"
+	eh := auditHash(ph, tsStr, a.ActorID, a.ActorName, a.Action, a.Target, a.Detail, a.ClientIP, verifier)
+
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO audit_logs (ts, actor_id, actor_name, action, target, detail, client_ip, prev_hash, entry_hash, verifier) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		tsMs, nullStr(a.ActorID), a.ActorName, a.Action, a.Target, nullStr(a.Detail), nullStr(a.ClientIP), ph, eh, verifier)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // QueryLogs returns paged query logs with optional filters (all parameters
@@ -213,9 +201,8 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		args = append(args, tenantID)
 	}
 	if qname != "" {
-		// 后缀匹配(rev_qname 虚拟列索引):避免前导 % 导致索引失效
-		where = append(where, "rev_qname LIKE ?")
-		args = append(args, reverseStr(qname)+"%")
+		where = append(where, "qname LIKE ?")
+		args = append(args, "%"+qname+"%")
 	}
 	if qtype != "" {
 		where = append(where, "qtype = ?")
@@ -233,29 +220,9 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 		limit = 100
 	}
 	w := " WHERE " + joinWhere(where)
-	// COUNT cache: same WHERE+args ⇒ same key. All args here are strings.
-	var key strings.Builder
-	key.WriteString(w)
-	for _, a := range args {
-		key.WriteString("|")
-		key.WriteString(a.(string))
-	}
 	var total int64
-	if cached, ok := queryCountCache.get(key.String()); ok {
-		total = cached
-	} else {
-		// 封顶 COUNT:表已数千万行规模,精确 COUNT 要扫整个索引(数秒~十几秒)。
-		// 分页 UI 只需要“还有没有更多”,超过 10000 条返回 10000 足够。
-		// 注意:MariaDB 的 LIMIT ROWS EXAMINED 在命中上限时对 COUNT(*) 返回
-		// 空结果集(导致 sql.ErrNoRows 500),必须用派生表:内层 LIMIT 10001
-		// 返回部分行(走覆盖索引扫描,~0.05s),外层再 COUNT。
-		const maxCountRows = 10001
-		countQ := "SELECT COUNT(*) FROM (SELECT 1 FROM query_logs" + w +
-			" LIMIT " + strconv.Itoa(maxCountRows) + ") AS _c"
-		if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
-			return nil, 0, err
-		}
-		queryCountCache.put(key.String(), total)
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM query_logs"+w, args...).Scan(&total); err != nil {
+		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT ts, tenant_id, client_ip, ecs, qname, qtype, rcode, cache_hit, upstream_group, upstream, rtt_ms, dnssec_ok, vip, via FROM query_logs"+w+
@@ -285,7 +252,7 @@ func (s *MySQLStore) QueryAudit(ctx context.Context, action string, limit int) (
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	q := `SELECT ts, actor_id, actor_name, action, target, detail, client_ip FROM audit_logs`
+	q := `SELECT ts, actor_id, actor_name, action, target, detail, client_ip, prev_hash, entry_hash, verifier FROM audit_logs`
 	args := []any{}
 	if action != "" {
 		q += ` WHERE action = ?`
@@ -301,17 +268,69 @@ func (s *MySQLStore) QueryAudit(ctx context.Context, action string, limit int) (
 	var out []model.AuditRow
 	for rows.Next() {
 		var a model.AuditRow
-		var aid, an, det, cip sql.NullString
-		if err := rows.Scan(&a.TS, &aid, &an, &a.Action, &a.Target, &det, &cip); err != nil {
+		var aid, an, det, cip, ph, eh, ver sql.NullString
+		if err := rows.Scan(&a.TS, &aid, &an, &a.Action, &a.Target, &det, &cip, &ph, &eh, &ver); err != nil {
 			return nil, err
 		}
 		a.ActorID = aid.String
 		a.ActorName = an.String
 		a.Detail = det.String
 		a.ClientIP = cip.String
+		a.PrevHash = ph.String
+		a.EntryHash = eh.String
+		a.Verifier = ver.String
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+
+// normalizeTS 时间字符串原样返回(数据库 DATE_FORMAT %f 的 6 位小数即权威值,
+// 不做 Parse/UTC 转换避免精度丢失或时区漂移导致哈希不一致)
+func normalizeTS(s string) string {
+	return s
+}
+
+// VerifyAuditChain 校验审计日志哈希链完整性, 返回是否完整 + 断点位置(-1=完整)
+// 等保: 审计日志完整性保护 - 任何中间篡改都会导致后续 entry_hash 全部失配
+func (s *MySQLStore) VerifyAuditChain(ctx context.Context, limit int) (bool, int64, error) {
+	if limit <= 0 || limit > 100000 {
+		limit = 10000
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s.%f') AS ts, actor_id, actor_name, action, target, detail, client_ip, prev_hash, entry_hash, verifier FROM audit_logs ORDER BY id ASC LIMIT ?`, limit)
+	if err != nil {
+		return false, 0, err
+	}
+	defer rows.Close()
+	prev := ""
+	started := false
+	for rows.Next() {
+		var id int64
+		var ts, aid, an, action, target, det, cip, ph, eh, ver sql.NullString
+		if err := rows.Scan(&id, &ts, &aid, &an, &action, &target, &det, &cip, &ph, &eh, &ver); err != nil {
+			return false, 0, err
+		}
+		// 跳过迁移前的旧记录(无 entry_hash): 从第一条有哈希的日志开始校验
+		if !eh.Valid || eh.String == "" {
+			continue
+		}
+		if !started {
+			// 新链起点: prev_hash 应等于上一行(无论是否旧记录)的 entry_hash;
+			// 迁移场景 prev_hash 为空则视为 genesis
+			started = true
+			if ph.Valid && ph.String != "" {
+				prev = ph.String
+			}
+		}
+		tsStr := normalizeTS(ts.String)
+		calc := auditHash(prev, tsStr, aid.String, an.String, action.String, target.String, det.String, cip.String, ver.String)
+		if calc != eh.String {
+			return false, id, nil
+		}
+		prev = eh.String
+	}
+	return true, -1, rows.Err()
 }
 
 func joinWhere(parts []string) string {
@@ -324,13 +343,4 @@ func joinWhere(parts []string) string {
 		}
 	}
 	return out
-}
-
-// reverseStr reverses a string (for REVERSE(qname) indexed lookup).
-func reverseStr(s string) string {
-	r := []rune(s)
-	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
-		r[i], r[j] = r[j], r[i]
-	}
-	return string(r)
 }

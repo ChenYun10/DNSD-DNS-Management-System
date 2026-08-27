@@ -5,7 +5,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -16,15 +15,10 @@ import (
 	"dns-platform/internal/store"
 )
 
-// cacheInvalidateChan is the Redis pub/sub channel used to propagate cache
-// purge/del across instances, so L1 caches are invalidated promptly in a
-// cluster (beyond the L1 TTL cap).
-const cacheInvalidateChan = "dns:l1:invalidate"
-
 // Core is the DNS request pipeline shared by all listeners
 // (UDP / TCP / DoT / DoH / DoQ) and the ECS simulation API:
 //
-//	parse → tenant resolve → rate limit → ECS extract → cache lookup (L1+Redis) →
+//	parse → tenant resolve → rate limit → ECS extract → cache lookup →
 //	singleflight → split/分流 → upstream failover → DNSSEC policy →
 //	cache write → async MySQL log → metrics
 type Core struct {
@@ -39,17 +33,11 @@ type Core struct {
 	warm     *WarmupManager
 	limiter  *Limiter
 	stats    *Stats
-	rdb      *redis.Client
 
 	byUpstream *CounterSet // upstream -> queries
 	byTenant   *CounterSet // tenant -> queries
 
 	hotLoaded bool
-
-	hotMu sync.RWMutex
-	hot   map[string]map[string]bool // tenantID("*"=global) -> hot domain set
-
-	warmSem chan struct{} // bounds concurrent adaptive-warm goroutines
 }
 
 // RequestMeta carries transport-level context into the pipeline
@@ -78,24 +66,14 @@ func NewCore(cfg *config.Config, cacheDrv store.Cache, logger *store.QueryLogWri
 		stats:      NewStats(),
 		byUpstream: NewCounterSet(),
 		byTenant:   NewCounterSet(),
-		rdb:        rdb,
-		hot:        make(map[string]map[string]bool),
-		warmSem:    make(chan struct{}, 32),
 	}
 	c.warm = NewWarmupManager(cfg, rdb, c)
-	c.warm.Start()
 	// adaptive warm hook: hot entries near expiry refresh in background
 	c.cache.warmHook = func(tenantID, key, qname, qtype string, ecs *ECSInfo, ttlLeft time.Duration) {
-		if !c.isHotDomainLocal(tenantID, qname) {
+		if !isHotDomain(rdb, tenantID, qname) {
 			return
 		}
-		select {
-		case c.warmSem <- struct{}{}:
-		default:
-			return // already saturated — skip this refresh round
-		}
 		go func() {
-			defer func() { <-c.warmSem }()
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.UpstreamTimeout+2*time.Second)
 			defer cancel()
 			tenant, err := repos.GetTenant(ctx, tenantID)
@@ -109,19 +87,6 @@ func NewCore(cfg *config.Config, cacheDrv store.Cache, logger *store.QueryLogWri
 				req = attachECS(req, ecs)
 			}
 			c.fetchAndCache(ctx, tenant, req, ecs, nil, "adaptive-warm")
-		}()
-	}
-	// cross-instance L1 invalidation: purge requests from any instance (or the
-	// control plane) clear this instance's local hot cache immediately.
-	if rdb != nil {
-		go func() {
-			sub := rdb.Subscribe(context.Background(), cacheInvalidateChan)
-			defer sub.Close()
-			for msg := range sub.Channel() {
-				if msg.Payload != "" {
-					c.cache.PurgeLocal(msg.Payload)
-				}
-			}
 		}()
 	}
 	return c
@@ -159,23 +124,6 @@ func (c *Core) ReloadAll(ctx context.Context) error {
 }
 
 func (c *Core) reloadHotSet(ctx context.Context, hots []*model.HotDomain) {
-	c.hotMu.Lock()
-	c.hot = make(map[string]map[string]bool)
-	for _, h := range hots {
-		if !h.Enabled {
-			continue
-		}
-		tid := h.TenantID
-		if tid == "" {
-			tid = "*"
-		}
-		if c.hot[tid] == nil {
-			c.hot[tid] = map[string]bool{}
-		}
-		c.hot[tid][strings.ToLower(h.Domain)] = true
-	}
-	c.hotMu.Unlock()
-	// keep the Redis hot sets for external tooling / compatibility
 	if c.warm.rdb == nil {
 		return
 	}
@@ -200,58 +148,6 @@ func (c *Core) reloadHotSet(ctx context.Context, hots []*model.HotDomain) {
 	}
 	pipe.Exec(ctx)
 	c.hotLoaded = true
-}
-
-// isHotDomainLocal is the in-memory hot-set check (no Redis per query).
-// Matches exact qname first, then longest-suffix walk.
-func (c *Core) isHotDomainLocal(tenantID, qname string) bool {
-	c.hotMu.RLock()
-	defer c.hotMu.RUnlock()
-	q := strings.ToLower(strings.TrimSuffix(qname, "."))
-	check := func(set map[string]bool) bool {
-		if set == nil {
-			return false
-		}
-		if set[q] {
-			return true
-		}
-		parts := strings.Split(q, ".")
-		for i := 1; i < len(parts)-1; i++ {
-			if set[strings.Join(parts[i:], ".")] {
-				return true
-			}
-		}
-		return false
-	}
-	if check(c.hot["*"]) {
-		return true
-	}
-	if check(c.hot[tenantID]) {
-		return true
-	}
-	return false
-}
-
-// PurgeCache clears the answer cache for a prefix across the whole cluster:
-// this instance's L1 + Redis + pub/sub invalidation of every peer's L1.
-// Returns the total number of entries removed.
-func (c *Core) PurgeCache(ctx context.Context, prefix string) (int64, error) {
-	n1 := c.cache.PurgeLocal(prefix)
-	n2, err := c.cacheDrv.Purge(ctx, prefix)
-	if c.rdb != nil {
-		c.rdb.Publish(ctx, cacheInvalidateChan, prefix)
-	}
-	return n1 + n2, err
-}
-
-// DelCacheKey removes a single cache key cluster-wide (L1 + Redis + pub/sub).
-func (c *Core) DelCacheKey(ctx context.Context, key string) error {
-	c.cache.DelLocal(key)
-	err := c.cacheDrv.Del(ctx, key)
-	if c.rdb != nil {
-		c.rdb.Publish(ctx, cacheInvalidateChan, key)
-	}
-	return err
 }
 
 // Stats returns the rolling stats object.
@@ -285,9 +181,6 @@ func (c *Core) CacheDriver() store.Cache { return c.cacheDrv }
 
 // Warmup exposes the warmup manager (for API-driven pre-warming).
 func (c *Core) Warmup() *WarmupManager { return c.warm }
-
-// LocalCacheLen reports the in-process (L1) answer cache size.
-func (c *Core) LocalCacheLen() int { return c.cache.LocalLen() }
 
 // Limiter exposes the DNS rate limiter.
 func (c *Core) Limiter() *Limiter { return c.limiter }
@@ -380,24 +273,6 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 			req = attachECS(req, def)
 		}
 	}
-	// --- auto-ECS: typical stub clients send no ECS; synthesize one from
-	// the client source address (global IPs only) for geo-accurate (就近) resolution.
-	if (ecs == nil || !ecs.HasOption) && c.cfg.ECSPassthrough && meta.ClientIP != nil {
-		ip := meta.ClientIP
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
-			ip = nil
-		}
-		if ip != nil {
-			if v4 := ip.To4(); v4 != nil {
-				ecs = &ECSInfo{Family: 1, Source: 24, Address: v4.Mask(net.CIDRMask(24, 32)), HasOption: true}
-			} else if v6 := ip.To16(); v6 != nil {
-				ecs = &ECSInfo{Family: 2, Source: 56, Address: v6.Mask(net.CIDRMask(56, 128)), HasOption: true}
-			}
-			if ecs != nil && ecs.HasOption {
-				req = attachECS(req, ecs)
-			}
-		}
-	}
 	ecsKey := ecsToCacheString(ecs)
 	if ecsKey != "" {
 		c.warm.TrackActiveECS(ctx, tenantID, ecsKey)
@@ -406,15 +281,15 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 	qname := strings.ToLower(q.Name)
 	cacheKey := store.CacheKey(tenantID, ecsKey, qname, dns.TypeToString[q.Qtype])
 
-	// --- cache lookup (L1 local + Redis L2) ---
-	if m, hit, ttlLeft := c.cache.Get(ctx, cacheKey, req.Id); hit {
+	// --- cache lookup ---
+	if m, hit := c.cache.Get(ctx, cacheKey, req.Id); hit {
 		c.stats.IncHit()
 		rm.CacheHit = true
 		rm.FromCache = true
 		rm.RCode = dns.RcodeToString[m.Rcode]
-		// adaptive pre-warm check for near-expiry hot entries (TTL already
-		// known — no second Redis read)
-		if ttlLeft > 0 {
+		// adaptive pre-warm check for near-expiry hot entries
+		if ent, _ := c.cacheDrv.Get(ctx, cacheKey); ent != nil {
+			ttlLeft := time.Duration(ent.TTL-(time.Now().Unix()-ent.Stored)) * time.Second
 			c.cache.ObserveAdaptiveWarm(ctx, tenantID, cacheKey, qname, dns.TypeToString[q.Qtype], ecs, ttlLeft)
 		}
 		rm.RTTMS = int(time.Since(start).Milliseconds())

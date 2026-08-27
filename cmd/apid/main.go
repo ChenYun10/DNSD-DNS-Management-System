@@ -15,7 +15,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"dns-platform/internal/api"
-	"dns-platform/internal/certmgr"
 	"dns-platform/internal/config"
 	"dns-platform/internal/dnsx"
 	"dns-platform/internal/store"
@@ -65,14 +64,7 @@ func main() {
 	}
 	core.UpstreamManager().StartHealthChecks()
 
-	// Admin-managed SSL: ACME issuance + renewal for tenant custom domains.
-	mgr, err := certmgr.New(cfg, repos, rdb)
-	if err != nil {
-		log.Fatalf("certmgr: %v", err)
-	}
-	go mgr.RenewLoop(context.Background())
-
-	srv := api.New(cfg, repos, mysql, qlw, core, rdb, mgr)
+	srv := api.New(cfg, repos, mysql, qlw, core, rdb)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("api start: %v", err)
 	}

@@ -80,7 +80,7 @@ func (a *API) simulate(w http.ResponseWriter, r *http.Request) {
 			ecsKey = ecs.String()
 		}
 		key := store.CacheKey(tenant.ID, ecsKey, strings.ToLower(qname), qtype)
-		a.core.DelCacheKey(r.Context(), key)
+		a.core.CacheDriver().Del(r.Context(), key)
 	}
 
 	// build the query exactly like a client would

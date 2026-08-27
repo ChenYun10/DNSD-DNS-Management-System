@@ -8,34 +8,15 @@ import "time"
 type Role string
 
 const (
-	RoleAdmin  Role = "admin"
-	RoleTenant Role = "tenant"
+	RoleAdmin     Role = "admin"     // 平台超级管理员(兼容旧版,等价 sysadmin)
+	RoleSysAdmin  Role = "sysadmin"  // 系统管理员:租户/上游/规则/缓存/用户管理
+	RoleSecAdmin  Role = "secadmin"  // 安全管理员:账号锁定/安全策略/告警配置
+	RoleAuditAdmin Role = "auditadmin" // 审计管理员:仅审计日志查看/导出/保全
+	RoleTenant    Role = "tenant"    // 租户(客户)管理员
 )
 
-type CertStatus string
-
-const (
-	CertNone     CertStatus = "none"
-	CertIssuing  CertStatus = "issuing"
-	CertActive   CertStatus = "active"
-	CertRenewing CertStatus = "renewing"
-	CertError    CertStatus = "error"
-)
-
-// TenantDomain is a customer-owned main domain bound to a tenant (客户自定义
-// 主域名). Queries arriving with SNI/Host matching the domain or any subdomain
-// route to the tenant, and the platform issues/renews its TLS cert via ACME.
-type TenantDomain struct {
-	ID         string     `json:"id"`
-	TenantID   string     `json:"tenant_id"`
-	Domain     string     `json:"domain"`
-	Enabled    bool       `json:"enabled"`
-	CertStatus CertStatus `json:"cert_status"`
-	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
-	CertError  string     `json:"cert_error,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-}
+// 三员分立:系统/安全/审计三权分立,互不兼任
+// sysadmin 管业务配置,不可删审计日志;secadmin 管安全策略;auditadmin 只读审计
 
 // Tenant is a customer workspace. Each tenant owns one or more custom
 // DoT/DoH prefixes (e.g. "acme-01.dns.example.com"). VIP tenants get a
@@ -84,6 +65,8 @@ type User struct {
 	FailedAttempts int       `json:"-"`
 	LockedUntil    time.Time `json:"-"`
 	LastLogin      time.Time `json:"last_login"`
+	MustChangePwd  bool      `json:"must_change_pwd"` // 等保:强制改密
+	PwdChangedAt   time.Time `json:"pwd_changed_at"`  // 等保:密码最近更新时间
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -158,30 +141,33 @@ type HotDomain struct {
 
 // QueryLogRow is one DNS query record written to MySQL asynchronously.
 type QueryLogRow struct {
-	TS          time.Time `json:"ts"`
-	TenantID    string    `json:"tenant_id"`
-	ClientIP    string    `json:"client_ip"`
-	ECS         string    `json:"ecs"`
-	QName       string    `json:"qname"`
-	QType       string    `json:"qtype"`
-	RCode       string    `json:"rcode"`
-	CacheHit    bool      `json:"cache_hit"`
-	UpstreamGrp string    `json:"upstream_group"`
-	Upstream    string    `json:"upstream"`
-	RTTMS       int       `json:"rtt_ms"`
-	DNSSECOK    bool      `json:"dnssec_ok"`
-	VIP         bool      `json:"vip"`
-	Via         string    `json:"via"` // udp|tcp|dot|doh|doq
+	TS          time.Time
+	TenantID    string
+	ClientIP    string
+	ECS         string
+	QName       string
+	QType       string
+	RCode       string
+	CacheHit    bool
+	UpstreamGrp string
+	Upstream    string
+	RTTMS       int
+	DNSSECOK    bool
+	VIP         bool
+	Via         string // udp|tcp|dot|doh|doq
 }
 
 type AuditRow struct {
-	TS        time.Time `json:"ts"`
-	ActorID   string    `json:"actor_id"`
-	ActorName string    `json:"actor_name"`
-	Action    string    `json:"action"`
-	Target    string    `json:"target"`
-	Detail    string    `json:"detail"` // JSON string
-	ClientIP  string    `json:"client_ip"`
+	TS        time.Time
+	ActorID   string
+	ActorName string
+	Action    string
+	Target    string
+	Detail    string // JSON string
+	ClientIP  string
+	PrevHash  string // 哈希链:上一条 entry_hash
+	EntryHash string // 本条 SHA-256
+	Verifier  string // 写入者标识
 }
 
 // SimulateResult is returned by the ECS simulation API ("前端ecs模拟"):
