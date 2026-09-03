@@ -22,6 +22,29 @@ func (a *API) getCertMgr() *certmgr.Manager {
 	return a.certs
 }
 
+// validDomain 严格校验域名：仅小写字母/数字/连字符与点号，禁止空标签、连字符
+// 起止、连续点、路径穿越（/ \ ..）与通配符，防止域名被用于证书路径穿越。
+func validDomain(s string) bool {
+	if s == "" || len(s) > 253 || strings.Contains(s, "..") {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // listDomains GET /api/v1/domains?tenant_id= — all domains (admin) or scoped.
 func (a *API) listDomains(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
@@ -50,7 +73,7 @@ func (a *API) createDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Domain = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(req.Domain, ".")))
-	if req.Domain == "" || !strings.Contains(req.Domain, ".") || strings.Contains(req.Domain, " ") {
+	if !validDomain(req.Domain) {
 		writeErr(w, http.StatusBadRequest, "valid domain required (e.g. dns.customer.com)")
 		return
 	}

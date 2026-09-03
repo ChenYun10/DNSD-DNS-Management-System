@@ -195,6 +195,19 @@ type AuditRow struct {
 	Verifier  string    `json:"verifier"`  // 写入者标识
 }
 
+// DualstackBinding maps an IPv6 subnet to the client's real IPv4 (运营商 BRAS/
+// 地址分配绑定表). Used to derive the client's IPv4 from an internal IPv6
+// access address before ECS passthrough.
+type DualstackBinding struct {
+	ID         string    `json:"id"`
+	IPv6Subnet string    `json:"ipv6_subnet"` // e.g. 2001:db8:100::/48
+	IPv4       string    `json:"ipv4"`        // e.g. 116.62.52.1
+	ISP        string    `json:"isp"`         // 运营商（可选）
+	Region     string    `json:"region"`      // 归属地（可选）
+	Enabled    bool      `json:"enabled"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // SimulateResult is returned by the ECS simulation API ("前端ecs模拟"):
 // it shows exactly how a query with a given ECS would traverse the pipeline.
 type SimulateResult struct {

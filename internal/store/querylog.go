@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -193,7 +194,13 @@ func (s *MySQLStore) WriteAudit(ctx context.Context, a model.AuditRow) error {
 
 // QueryLogs returns paged query logs with optional filters (all parameters
 // are bound, never concatenated — no SQL injection surface).
-func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from, to string, limit, offset int) ([]model.QueryLogRow, int64, error) {
+//
+// 性能约束（应对百万级日志）：
+//   - 调用方应始终传入 from/to（由 handler 兜底默认时间窗），保证走 idx_ql_ts 索引
+//   - qname 走 LIKE 子串时转义通配符，避免用户输入放大扫描范围
+//   - COUNT(*) 用 LIMIT 子查询封顶（countCap），避免对全量结果集计数
+//   - 排序用 ts DESC, id DESC（稳定且命中索引）
+func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from, to string, limit, offset, countCap int) ([]model.QueryLogRow, int64, error) {
 	where := []string{"1=1"}
 	args := []any{}
 	if tenantID != "" {
@@ -202,7 +209,7 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 	}
 	if qname != "" {
 		where = append(where, "qname LIKE ?")
-		args = append(args, "%"+qname+"%")
+		args = append(args, "%"+escapeLike(qname)+"%")
 	}
 	if qtype != "" {
 		where = append(where, "qtype = ?")
@@ -219,14 +226,23 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	if countCap <= 0 {
+		countCap = 100000
+	}
 	w := " WHERE " + joinWhere(where)
+
+	// 封顶计数：只统计前 countCap 条，避免对百万级结果集做 COUNT(*)
 	var total int64
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM query_logs"+w, args...).Scan(&total); err != nil {
+	countArgs := append(append([]any{}, args...), countCap)
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM (SELECT 1 FROM query_logs"+w+" LIMIT ?) t", countArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+
+	pageArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT ts, tenant_id, client_ip, ecs, qname, qtype, rcode, cache_hit, upstream_group, upstream, rtt_ms, dnssec_ok, vip, via FROM query_logs"+w+
-			" ORDER BY ts DESC LIMIT ? OFFSET ?", append(args, limit, offset)...)
+			" ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", pageArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -331,6 +347,15 @@ func (s *MySQLStore) VerifyAuditChain(ctx context.Context, limit int) (bool, int
 		prev = eh.String
 	}
 	return true, -1, rows.Err()
+}
+
+// escapeLike 转义 LIKE 模式中的通配符（% _ \），防止用户输入 % 或 _ 被当作
+// 通配符放大扫描范围（也是防注入面收窄的一环）。
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 func joinWhere(parts []string) string {

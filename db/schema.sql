@@ -126,7 +126,32 @@ CREATE TABLE IF NOT EXISTS hot_domains (
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------------------------------
+-- 内网双栈绑定表（IPv6 子网 → 客户端真实 IPv4，用于 ECS 推导与透传）
+-- 数据来源：运营商 BRAS / 地址分配系统。IPv4 必须与 IPv6 指向同一物理
+-- 归属地/运营商；数据面在 ReloadAll 时读入内存做最长前缀匹配。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dualstack_bindings (
+  id          CHAR(36)     NOT NULL PRIMARY KEY,
+  ipv6_subnet VARCHAR(45)  NOT NULL,                  -- 如 2001:db8:100::/48
+  ipv4        VARCHAR(15)  NOT NULL,                  -- 如 116.62.52.1
+  isp         VARCHAR(64)  NULL,                      -- 运营商（可选，仅展示/审计）
+  region      VARCHAR(128) NULL,                      -- 归属地（可选）
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1,
+  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_dsb_subnet (ipv6_subnet),
+  INDEX idx_dsb_ipv4 (ipv4)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------------
 -- 查询日志（高并发写入：异步批量；建议按天分区/归档）
+--
+-- 索引策略（配合 LOG_QUERY_DEFAULT_WINDOW/LOG_QUERY_MAX_WINDOW 时间窗查询）：
+--   * idx_ql_ts (ts)：InnoDB 二级索引末尾隐式含主键 id，即 (ts, id)；
+--     可直接支撑「WHERE ts BETWEEN ? AND ? ORDER BY ts DESC, id DESC」的范围
+--     扫描（反向扫描），避免全表扫描与 filesort。
+--   * idx_ql_tenant_ts (tenant_id, ts)：支撑「租户 × 时间窗」过滤。
+--   * 刻意不建 qname 索引：日志检索用 LIKE '%…%'（前置通配），B 树索引无法
+--     命中，建了只会放大每次 INSERT 的写放大与磁盘占用（见迁移脚本删除）。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS query_logs (
   id             BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -145,8 +170,7 @@ CREATE TABLE IF NOT EXISTS query_logs (
   vip            TINYINT(1)   NOT NULL DEFAULT 0,
   via            VARCHAR(8)   NOT NULL DEFAULT 'udp',   -- udp|tcp|dot|doh|doq|simulate
   INDEX idx_ql_ts (ts),
-  INDEX idx_ql_tenant_ts (tenant_id, ts),
-  INDEX idx_ql_qname (qname)
+  INDEX idx_ql_tenant_ts (tenant_id, ts)
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------------------------------

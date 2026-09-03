@@ -65,6 +65,39 @@ DNS 请求路径（dnsd）只访问 Redis；MySQL 仅在启动/配置变更时�
 | 模拟 | `POST /api/v1/dns/simulate`：携带模拟 ECS 走完整管线，返回缓存/分流/上游/耗时全链路 trace |
 | 预热 | 活跃 ECS 记录到 Redis Set（7 天 TTL）→ 预热任务按 活跃ECS×热域名 扩散 |
 
+### 4.1 内网 IPv6 → IPv4 双栈 ECS 推导（透传真实 IPv4）
+
+面向「内网 IPv6 接入、上游权威需要真实 IPv4 做 GeoDNS」的场景：内网客户端经
+专用监听（`INT_LISTEN_UDP/TCP`）访问时，数据面从客户端 IPv6 推导其真实 IPv4，
+并在校验一致后将该 IPv4 透传为 ECS 到权威上游。
+
+```
+内网 IPv6 客户端 ──► 内网监听(int-udp/tcp, meta.Internal=true)
+                        │
+                        ▼
+             1. 三级映射（按优先级）
+                ① 内嵌：IPv4-mapped(::ffff:) / RFC6052 NAT64 前缀
+                ② 绑定表：IPv6 子网→IPv4 最长前缀匹配（文件 CSV + MySQL 合并）
+                ③ 外部 API：HTTP 接口按 IPv6 查真实 IPv4
+                        │ 得到 IPv4
+                        ▼
+             2. 一致性校验（纯真 IP 库，fail-closed）
+                查 IPv6 与 IPv4 的 归属地+运营商 → 省+运营商一致（可选+城市）
+                        │
+                 ┌──────┴──────┐
+              一致            不一致 / 库缺失 / 映射失败
+                 │                 │
+                 ▼                 ▼
+        透传 IPv4 为 ECS      不携带 ECS（按无 ECS 转发）
+```
+
+- 仅在「内网监听 + IPv6 客户端 + 无客户端自带 ECS」时触发，推导出的 IPv4 按
+  `ECS_DERIVE_MASK`（默认 /32）掩码后作为 ECS，并进入缓存 key（GeoDNS 正确性）。
+- 校验是硬前提：`GEO_IPV4_FILE`（纯真 qqwry.dat）与 `GEO_IPV6_FILE`（IPv6 归属地
+  CSV）都配置才启用校验；任一缺失或校验失败一律不携带 ECS。
+- 绑定表来源：`IPV6_IPV4_MAP_FILE`（文件）+ `dualstack_bindings` 表（MySQL），
+  二者随配置热加载 `ReloadAll` 合并进内存做最长前缀匹配。
+
 ## 5. 缓存设计（Redis）
 
 - **key**：`dns:cache:{tenant}:{ecs}:{qname}:{qtype}`，qname 小写、值域白名单过滤（防注入）
@@ -87,6 +120,12 @@ DNS 请求路径（dnsd）只访问 Redis；MySQL 仅在启动/配置变更时�
 
 - **查询日志**：内存 channel(8192) + 批量 INSERT（500 条或 2s），MySQL 故障时丢弃最旧并计数，
   服务不降级；`query_logs` 建议按天分区归档
+- **日志查询性能**（百万级日志防扫全库）：
+  - 时间窗兜底：`from/to` 为空时默认查最近 `LOG_QUERY_DEFAULT_WINDOW`（24h），
+    跨度超 `LOG_QUERY_MAX_WINDOW`（168h）自动截断 → 恒走 `idx_ql_ts` 范围扫描
+  - `qname` 子串匹配会转义 `%/_/\` 通配符，避免用户输入放大扫描范围
+  - `COUNT(*)` 用 `LIMIT` 子查询封顶（`LOG_QUERY_COUNT_CAP`），不对全量结果集计数
+  - 排序 `ts DESC, id DESC`（稳定且命中索引）；`OFFSET` 上限 `LOG_QUERY_MAX_OFFSET`
 - **审计日志**：所有管理动作（登录/租户/前缀/上游/预热/清理）只追加写入 `audit_logs`
 - **指标**：进程内 60s 滚动窗口（QPS/命中率/错误率）+ 累计值 + 按上游/租户计数，
   `GET /api/v1/stats/overview` 输出

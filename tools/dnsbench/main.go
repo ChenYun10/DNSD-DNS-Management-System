@@ -143,8 +143,6 @@ func main() {
 	done := time.After(*dur)
 	stop := make(chan struct{})
 
-	var wg sync.WaitGroup
-	_ = wg
 	for i := 0; i < *threads; i++ {
 		go worker(i)
 	}
@@ -183,8 +181,6 @@ loop:
 	time.Sleep(1000 * time.Millisecond) // 等 in-flight 回来(worker 随进程退出)
 	ticker.Stop()
 
-	total := okCount.Load() + errCount.Load()
-	_ = total
 	latMu.Lock()
 	sort.Float64s(lats)
 	latMu.Unlock()

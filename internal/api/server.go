@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -43,10 +44,15 @@ type API struct {
 	certs   *certmgr.Manager
 }
 
+// trustProxyHeaders 由 New() 在启动时设置一次；clientIP 据此决定是否信任
+// 反向代理注入的 X-Real-IP（防止直连暴露时伪造来源 IP 绕过限流/审计）。
+var trustProxyHeaders atomic.Bool
+
 func New(cfg *config.Config, repos *store.Repos, mysql *store.MySQLStore, logger *store.QueryLogWriter, core *dnsx.Core, rdb *redis.Client, certs *certmgr.Manager) *API {
 	a := &API{cfg: cfg, repos: repos, mysql: mysql, logger: logger, core: core, rdb: rdb, certs: certs}
 	a.limiter = dnsx.NewLimiter(rdb, cfg.RateLimitQPS, cfg.RateLimitVIPMult)
 	a.auth = NewAuth(cfg, repos, mysql, rdb, a.limiter)
+	trustProxyHeaders.Store(cfg.TrustProxyHeaders)
 	return a
 }
 
@@ -298,8 +304,12 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 // --- helpers ---
 
 func clientIP(r *http.Request) string {
-	if ip := net.ParseIP(r.Header.Get("X-Real-IP")); ip != nil {
-		return ip.String()
+	// 仅在明确启用代理信任时才读取 X-Real-IP；否则使用 socket 对端地址，
+	// 防止客户端直连时伪造来源 IP 绕过限流/审计/锁定。
+	if trustProxyHeaders.Load() {
+		if ip := net.ParseIP(r.Header.Get("X-Real-IP")); ip != nil {
+			return ip.String()
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {

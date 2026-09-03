@@ -170,6 +170,12 @@ func (r *Repos) UpdateUser(ctx context.Context, u *model.User) error {
 	return err
 }
 
+// DeleteUser removes a user (账号退役)。调用方需先吊销其会话。
+func (r *Repos) DeleteUser(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id)
+	return err
+}
+
 func (r *Repos) RecordLoginFailure(ctx context.Context, userID string) error {
 	_, err := r.db.ExecContext(ctx,
 		"UPDATE users SET failed_attempts = failed_attempts + 1, locked_until = IF(failed_attempts + 1 >= 5, DATE_ADD(NOW(), INTERVAL 15 MINUTE), locked_until) WHERE id = ?", userID)
@@ -604,6 +610,28 @@ func defaultPort(p model.UpstreamProtocol) int {
 	default:
 		return 53
 	}
+}
+
+// ListDualstackBindings returns the enabled IPv6→IPv4 bindings (内网双栈绑定表).
+func (r *Repos) ListDualstackBindings(ctx context.Context) ([]*model.DualstackBinding, error) {
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, ipv6_subnet, ipv4, isp, region, enabled, created_at FROM dualstack_bindings WHERE enabled = 1")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.DualstackBinding
+	for rows.Next() {
+		b := &model.DualstackBinding{}
+		var isp, region sql.NullString
+		if err := rows.Scan(&b.ID, &b.IPv6Subnet, &b.IPv4, &isp, &region, &b.Enabled, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		b.ISP = isp.String
+		b.Region = region.String
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 // LoadRulesForTenant returns the effective split rules for a tenant:

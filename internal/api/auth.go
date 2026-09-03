@@ -94,7 +94,8 @@ func (a *Auth) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u.LockedUntil.After(time.Now()) {
-		writeErr(w, http.StatusLocked, "account locked until "+u.LockedUntil.Format(time.RFC3339))
+		// 统一 401，避免通过 423+锁定时间 暴露账号存在性与锁定窗口（账号枚举）
+		writeErr(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 	if !store.CheckPassword(u.PasswordHash, req.Password) {
@@ -168,6 +169,15 @@ func (a *Auth) refresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "user not found")
 		return
 	}
+	// 账号锁定或强制改密时拒绝续签，保证降权/锁定即时生效
+	if u.LockedUntil.After(time.Now()) {
+		writeErr(w, http.StatusUnauthorized, "account locked")
+		return
+	}
+	if u.MustChangePwd {
+		writeErr(w, http.StatusUnauthorized, "password change required")
+		return
+	}
 	pair, err := a.issuePair(r.Context(), u)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "token issue failed")
@@ -184,7 +194,9 @@ func (a *Auth) logout(w http.ResponseWriter, r *http.Request) {
 		if ttl > 0 {
 			a.rdb.Set(r.Context(), "dns:jwt:blacklist:"+claims.ID, "1", ttl)
 		}
-		a.rdb.Del(r.Context(), "dns:refresh:"+claims.ID)
+		// 吊销该用户全部 refresh token（旧实现按 access jti 删除不存在的键，
+		// 导致登出后旧 refresh token 仍可续签）。
+		_ = a.repos.RevokeAllSessions(r.Context(), claims.Subject, a.rdb)
 		if u, _ := a.repos.GetUserByID(r.Context(), claims.Subject); u != nil {
 			a.audit(r, u, "auth.logout", "user:"+u.Username, "")
 		}

@@ -23,6 +23,10 @@ import (
 	"dns-platform/internal/model"
 )
 
+// connReadTimeout 是 DoT/DoQ 等长连接上单次读取的超时上限，用于防御慢速连接
+// 资源耗尽（slowloris）。
+const connReadTimeout = 30 * time.Second
+
 // Server binds all downstream listeners:
 //
 //	:53   UDP + TCP  — traditional DNS (enterprise resolvers, ECS carriers)
@@ -37,10 +41,12 @@ type Server struct {
 	cfg  *config.Config
 	core *Core
 
-	udp *dns.Server
-	tcp *dns.Server
-	doh *http.Server
-	doq *quic.Listener
+	udp    *dns.Server
+	tcp    *dns.Server
+	intUDP *dns.Server // 内网专用 UDP 监听（IPv6 双栈 ECS 推导）
+	intTCP *dns.Server // 内网专用 TCP 监听
+	doh    *http.Server
+	doq    *quic.Listener
 
 	tlsConf   *tls.Config
 	certStore *CertStore
@@ -110,6 +116,15 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 	s.udp = &dns.Server{Addr: cfg.DNSListenUDP, Net: "udp", Handler: handler, UDPSize: 4096}
 	s.tcp = &dns.Server{Addr: cfg.DNSListenTCP, Net: "tcp", Handler: handler}
 
+	// 内网专用监听：面向内网 IPv6 接入客户端，标记 Internal=true，触发
+	// 双栈 IPv6→IPv4 ECS 推导。地址为空则禁用。
+	if cfg.IntListenUDP != "" {
+		s.intUDP = &dns.Server{Addr: cfg.IntListenUDP, Net: "udp", Handler: s.internalHandler(), UDPSize: 4096}
+	}
+	if cfg.IntListenTCP != "" {
+		s.intTCP = &dns.Server{Addr: cfg.IntListenTCP, Net: "tcp", Handler: s.internalHandler()}
+	}
+
 	dohTLS := s.tlsConf.Clone()
 	dohTLS.NextProtos = []string{"h2", "http/1.1"}
 	s.doh = &http.Server{
@@ -131,6 +146,14 @@ func (s *Server) Start() error {
 	go func() { defer s.wg.Done(); s.serve("udp", func() error { return s.udp.ListenAndServe() }) }()
 	s.wg.Add(1)
 	go func() { defer s.wg.Done(); s.serve("tcp", func() error { return s.tcp.ListenAndServe() }) }()
+	if s.intUDP != nil {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.serve("int-udp", func() error { return s.intUDP.ListenAndServe() }) }()
+	}
+	if s.intTCP != nil {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.serve("int-tcp", func() error { return s.intTCP.ListenAndServe() }) }()
+	}
 	s.wg.Add(1)
 	go func() { defer s.wg.Done(); s.serve("doh", func() error { return s.doh.ListenAndServeTLS("", "") }) }()
 	s.wg.Add(1)
@@ -155,6 +178,19 @@ func (s *Server) serve(name string, fn func() error) {
 		s.errs = append(s.errs, err)
 		s.mu.Unlock()
 	}
+}
+
+// internalHandler 包装内网监听请求：标记 Internal=true，触发双栈 ECS 推导。
+func (s *Server) internalHandler() dns.Handler {
+	return dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		cw := &ctxWriter{ResponseWriter: w, internal: true, clientIP: clientIP(w.RemoteAddr())}
+		if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+			cw.via = "int-tcp"
+		} else {
+			cw.via = "int-udp"
+		}
+		s.core.ServeDNS(cw, r)
+	})
 }
 
 // --- DoT listener (RFC 7858) with SNI-based tenant routing ---
@@ -186,9 +222,12 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 	if !ok {
 		return
 	}
+	// 握手与后续读取均设置截止时间，防止慢速连接（slowloris）无限占用 goroutine/连接。
+	tc.SetDeadline(time.Now().Add(connReadTimeout))
 	if err := tc.Handshake(); err != nil {
 		return
 	}
+	tc.SetDeadline(time.Time{}) // 握手完成后清除整体截止时间，改由读取循环逐次设置
 	sni := tc.ConnectionState().ServerName
 	meta := &RequestMeta{Via: "dot", SNI: sni}
 	meta.Prefix = prefixFromSNI(sni, s.cfg.BaseDomain)
@@ -203,6 +242,7 @@ func (s *Server) serveDoTConn(conn net.Conn) {
 	// is used for the response.
 	r := bufio.NewReader(tc)
 	for {
+		tc.SetReadDeadline(time.Now().Add(connReadTimeout))
 		msg, framing, err := readDNSMessageCompat(r)
 		if err != nil {
 			return
@@ -378,7 +418,7 @@ func (s *Server) serveDoH(w http.ResponseWriter, r *http.Request) {
 	if t, _ := s.resolveTenant(r.Context(), host); t != nil {
 		meta.Tenant = t
 	}
-	meta.ClientIP = clientIPFromRequest(r)
+	meta.ClientIP = s.clientIPFromRequest(r)
 
 	var msg *dns.Msg
 	switch r.Method {
@@ -485,6 +525,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if err := s.tcp.ShutdownContext(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	if s.intUDP != nil {
+		if err := s.intUDP.ShutdownContext(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.intTCP != nil {
+		if err := s.intTCP.ShutdownContext(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := s.doh.Shutdown(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -555,10 +605,13 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func clientIPFromRequest(r *http.Request) net.IP {
-	// X-Real-IP is set by the local nginx (same-host proxy, see deploy/).
-	if ip := net.ParseIP(r.Header.Get("X-Real-IP")); ip != nil {
-		return ip
+func (s *Server) clientIPFromRequest(r *http.Request) net.IP {
+	// 仅在启用代理信任（TRUST_PROXY_HEADERS=true，部署于可信反代之后）时读取
+	// X-Real-IP；否则使用 socket 对端地址，防止直连暴露时伪造来源 IP。
+	if s.cfg.TrustProxyHeaders {
+		if ip := net.ParseIP(r.Header.Get("X-Real-IP")); ip != nil {
+			return ip
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {

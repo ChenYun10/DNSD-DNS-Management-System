@@ -47,6 +47,22 @@ func ecsFromMsg(m *dns.Msg) *ECSInfo {
 	return &ECSInfo{}
 }
 
+// clampScope 将 IPv4 ECS 源前缀收敛到 max（0..32），超出部分重新掩码。用于把
+// ECSScopeMax 真正作用于客户端/模拟 ECS，防止任意细粒度子网放大缓存键与上游负载。
+// IPv6 不受 0..32 范围约束（其前缀长度可达 /128）。
+func (e *ECSInfo) clampScope(max int) {
+	if e == nil || !e.HasOption || e.Family != 1 || e.Address == nil {
+		return
+	}
+	if max < 0 || max > 32 || int(e.Source) <= max {
+		return
+	}
+	e.Source = uint8(max)
+	if e.Source < 32 {
+		e.Address = e.Address.Mask(net.CIDRMask(int(e.Source), 32))
+	}
+}
+
 func (e *ECSInfo) normalize() {
 	if e.Source == 0 {
 		e.Source = 24

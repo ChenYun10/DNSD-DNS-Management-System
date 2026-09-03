@@ -406,6 +406,11 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 	default:
 		role = model.RoleTenant
 	}
+	// 租户用户必须绑定租户，防止无租户 tenant 用户越权读取全平台数据
+	if role == model.RoleTenant && in.TenantID == "" {
+		writeErr(w, http.StatusBadRequest, "租户用户必须绑定租户")
+		return
+	}
 	u := &model.User{
 		ID:             uuid.NewString(),
 		TenantID:       in.TenantID, // admin 也可绑定租户作为归属
@@ -440,6 +445,7 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	oldRole, oldTID := u.Role, u.TenantID
 	if in.Role != "" {
 		role := model.Role(in.Role)
 		switch role {
@@ -466,6 +472,10 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 	if err := a.repos.UpdateUser(r.Context(), u); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 角色或租户归属变更时吊销其全部会话，使降权/改绑即时生效
+	if u.Role != oldRole || u.TenantID != oldTID {
+		_ = a.repos.RevokeAllSessions(r.Context(), u.ID, a.rdb)
 	}
 	u.PasswordHash = ""
 	a.auditAction(r, "user.update", "user:"+u.Username, map[string]any{"tenant_id": u.TenantID, "role": u.Role})
@@ -508,7 +518,8 @@ func (a *API) setPassword(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := a.repos.GetUserByID(r.Context(), id); err != nil || id == "" {
+	u, err := a.repos.GetUserByID(r.Context(), id)
+	if err != nil || u == nil || id == "" {
 		writeErr(w, http.StatusNotFound, "user not found")
 		return
 	}
@@ -518,7 +529,13 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "cannot delete yourself")
 		return
 	}
-	a.auditAction(r, "user.delete", "user:"+id, "")
+	// 先吊销会话，再真正删除账号（旧实现只审计不删除，导致账号退役失效）
+	_ = a.repos.RevokeAllSessions(r.Context(), id, a.rdb)
+	if err := a.repos.DeleteUser(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.auditAction(r, "user.delete", "user:"+u.Username, "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

@@ -217,8 +217,28 @@ func (m *Manager) DomainCertExpiry(domain string) (time.Time, error) {
 	return c.NotAfter, nil
 }
 
+// withinCertDir 断言解析后的目录仍位于 CertDir 之内（防 ../ 路径穿越）。
+func (m *Manager) withinCertDir(dir string) bool {
+	base, err := filepath.Abs(m.cfg.CertDir)
+	if err != nil {
+		return false
+	}
+	d, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(base, d)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func (m *Manager) persist(domain string, res *certificate.Resource) error {
 	dir := m.DomainCertDir(domain)
+	if !m.withinCertDir(dir) {
+		return fmt.Errorf("refusing to persist cert outside cert dir for %q", domain)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}

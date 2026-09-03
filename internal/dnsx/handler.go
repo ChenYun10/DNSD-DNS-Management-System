@@ -34,6 +34,8 @@ type Core struct {
 	limiter  *Limiter
 	stats    *Stats
 
+	dualstack *Dualstack // IPv6→IPv4 ECS 推导 + 归属地/运营商校验
+
 	byUpstream *CounterSet // upstream -> queries
 	byTenant   *CounterSet // tenant -> queries
 
@@ -48,6 +50,7 @@ type RequestMeta struct {
 	Prefix        string // tenant prefix extracted from SNI
 	Tenant        *model.Tenant
 	ClientIP      net.IP
+	Internal      bool     // 请求来自内网专用监听器（触发 IPv6→IPv4 ECS 推导）
 	SimulateECS   *ECSInfo // set only for ECS simulation requests
 	SkipRateLimit bool     // set for API-driven simulation
 }
@@ -64,6 +67,7 @@ func NewCore(cfg *config.Config, cacheDrv store.Cache, logger *store.QueryLogWri
 		sec:        NewValidator(cfg.DNSSECMode),
 		limiter:    NewLimiter(rdb, cfg.RateLimitQPS, cfg.RateLimitVIPMult),
 		stats:      NewStats(),
+		dualstack:  NewDualstack(cfg),
 		byUpstream: NewCounterSet(),
 		byTenant:   NewCounterSet(),
 	}
@@ -120,6 +124,17 @@ func (c *Core) ReloadAll(ctx context.Context) error {
 	c.up.Reload(groups, upstreams, tenants)
 	c.split.Reload(rules)
 	c.reloadHotSet(ctx, hots)
+
+	// 双栈绑定表（可选；表缺失/查询失败不影响主流程，仅记录告警）
+	if c.dualstack != nil {
+		bindings, berr := c.repos.ListDualstackBindings(ctx)
+		if berr != nil {
+			log.Printf("[config] load dualstack bindings failed (ignored): %v", berr)
+			c.dualstack.Reload(nil)
+		} else {
+			c.dualstack.Reload(bindings)
+		}
+	}
 	return nil
 }
 
@@ -196,6 +211,7 @@ func (c *Core) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		meta.Prefix = cw.prefix
 		meta.Tenant = cw.tenant
 		meta.ClientIP = cw.clientIP
+		meta.Internal = cw.internal
 		if cw.via != "" {
 			meta.Via = cw.via
 		}
@@ -259,13 +275,24 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 
 	// --- ECS (模拟 / 传递 / 缓存作用域) ---
 	ecs := ecsFromMsg(req)
+	ecs.clampScope(c.cfg.ECSScopeMax) // 收敛客户端 ECS 前缀到 ECSScopeMax
 	if meta.SimulateECS != nil {
 		ecs = meta.SimulateECS
+		ecs.clampScope(c.cfg.ECSScopeMax)
 		req = attachECS(req, ecs) // rebuild the query with the simulated ECS
 	}
 	if ecs.HasOption && tenant != nil && !tenant.AllowECS {
 		ecs = nil // tenant does not allow client-supplied ECS
 		req = stripECS(req)
+	}
+	// 内网 IPv6 客户端：推导真实 IPv4 并透传为 ECS（仅当校验一致且无客户端 ECS）。
+	if c.cfg.DualstackEnabled && meta.Internal && meta.ClientIP != nil && meta.ClientIP.To4() == nil {
+		if ecs == nil || !ecs.HasOption {
+			if derived := c.dualstack.DeriveECS(ctx, meta.ClientIP); derived != nil {
+				ecs = derived
+				req = attachECS(req, derived)
+			}
+		}
 	}
 	if (ecs == nil || !ecs.HasOption) && tenant != nil && tenant.DefaultECS != "" {
 		if def, err := parseECSFromString(tenant.DefaultECS); err == nil {
@@ -472,6 +499,7 @@ type ctxWriter struct {
 	tenant   *model.Tenant
 	clientIP net.IP
 	via      string
+	internal bool
 }
 
 var _ = log.Printf // keep import when build tags change

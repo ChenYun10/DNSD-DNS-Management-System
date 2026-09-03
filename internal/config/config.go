@@ -59,6 +59,12 @@ type Config struct {
 	LogBatchSize     int           // rows per batch insert
 	LogFlushInterval time.Duration // max wait between flushes
 
+	// 查询日志查询性能（防止大数据量下扫全库/深分页）
+	LogQueryDefaultWindow time.Duration // from/to 为空时默认查询最近多久，默认 24h
+	LogQueryMaxWindow     time.Duration // 单次查询时间跨度上限，默认 168h；0=不限
+	LogQueryMaxOffset     int           // OFFSET 上限（防深分页），默认 100000
+	LogQueryCountCap      int           // COUNT(*) 封顶（超限按封顶返回），默认 100000
+
 	// DNSSEC
 	DNSSECMode string // passthrough | ad-only | verify
 	// If true, requests from validating upstreams that set AD propagate AD.
@@ -68,11 +74,34 @@ type Config struct {
 	ECSPassthrough bool // forward client ECS to upstreams that support it
 	ECSScopeMax    int  // clamp scope to /0..32, default 24
 
+	// 内网监听（面向内网 IPv6 接入客户端的专用 socket，与公网监听隔离）。
+	// 空字符串 = 禁用对应监听。
+	IntListenUDP string // 内网 UDP 监听，如 "[::]:5300" 或 "10.0.0.1:53"
+	IntListenTCP string // 内网 TCP 监听，如 "[::]:5300"
+
+	// IPv6→IPv4 双栈映射（从内网 IPv6 接入地址推导客户端真实 IPv4，
+	// 校验一致后将该 IPv4 透传为 ECS 到权威上游）。
+	DualstackEnabled bool     // 总开关（仅对内网监听上的 IPv6 客户端生效）
+	NAT64Prefixes    []string // RFC6052 NAT64 前缀，逗号分隔，如 "64:ff9b::/96"
+	MapFile          string   // 绑定表文件：CSV 行 "ipv6_subnet,ipv4[,isp[,region]]"
+	MapAPIURL        string   // 外部映射 API URL，{ip} 为 IPv6 占位符，空=禁用
+	MapAPITimeout    time.Duration
+	ECSDeriveMask    int // 推导出的 IPv4 ECS 前缀长度（默认 32，可放宽为 24）
+
+	// 归属地/运营商校验（纯真 IP 库）。校验通过才透传推导出的 IPv4 ECS。
+	GeoIPv4File  string // 纯真 qqwry.dat（IPv4 归属地+运营商）
+	GeoIPv6File  string // IPv6 归属地 CSV：ipv6_subnet,country,province,city,isp
+	GeoStrictCity bool  // true=要求省市一致；false=省+运营商一致即可
+
 	// Rate limiting
 	RateLimitQPS     int // default per-IP QPS cap
 	RateLimitVIPMult int // multiplier for VIP tenants
 	LoginRateLimit   int // failed logins per IP per window
 	LoginRateWindow  time.Duration
+
+	// 是否信任反向代理设置的 X-Real-IP。仅当部署在可信反代之后、且代理会
+	// 覆盖该头时才应开启；直连暴露时开启会允许伪造来源 IP 绕过限流/审计。
+	TrustProxyHeaders bool
 
 	// REST API
 	APIListen      string // customer/admin API, e.g. :8080
@@ -146,14 +175,30 @@ func Load(envFile string) (*Config, error) {
 		MySQLDSN:              getenv("MYSQL_DSN", "dns:dns@tcp(127.0.0.1:3306)/dns_platform?parseTime=true&charset=utf8mb4"),
 		LogBatchSize:          getint("LOG_BATCH_SIZE", 500),
 		LogFlushInterval:      getdur("LOG_FLUSH_INTERVAL", 2*time.Second),
+		LogQueryDefaultWindow: getdur("LOG_QUERY_DEFAULT_WINDOW", 24*time.Hour),
+		LogQueryMaxWindow:     getdur("LOG_QUERY_MAX_WINDOW", 7*24*time.Hour),
+		LogQueryMaxOffset:     getint("LOG_QUERY_MAX_OFFSET", 100000),
+		LogQueryCountCap:      getint("LOG_QUERY_COUNT_CAP", 100000),
 		DNSSECMode:            getenv("DNSSEC_MODE", "ad-only"),
 		RequireADFromUpstream: getbool("DNSSEC_REQUIRE_AD", true),
 		ECSPassthrough:        getbool("ECS_PASSTHROUGH", true),
 		ECSScopeMax:           getint("ECS_SCOPE_MAX", 24),
+		IntListenUDP:          getenv("INT_LISTEN_UDP", ""),
+		IntListenTCP:          getenv("INT_LISTEN_TCP", ""),
+		DualstackEnabled:      getbool("DUALSTACK_ENABLED", false),
+		NAT64Prefixes:         splitCSV(getenv("NAT64_PREFIXES", "")),
+		MapFile:               getenv("IPV6_IPV4_MAP_FILE", ""),
+		MapAPIURL:             getenv("IPV6_IPV4_MAP_API_URL", ""),
+		MapAPITimeout:         getdur("IPV6_IPV4_MAP_API_TIMEOUT", 500*time.Millisecond),
+		ECSDeriveMask:         getint("ECS_DERIVE_MASK", 32),
+		GeoIPv4File:           getenv("GEO_IPV4_FILE", ""),
+		GeoIPv6File:           getenv("GEO_IPV6_FILE", ""),
+		GeoStrictCity:         getbool("GEO_STRICT_CITY", false),
 		RateLimitQPS:          getint("RATE_LIMIT_QPS", 100),
 		RateLimitVIPMult:      getint("RATE_LIMIT_VIP_MULT", 10),
 		LoginRateLimit:        getint("LOGIN_RATE_LIMIT", 10),
 		LoginRateWindow:       getdur("LOGIN_RATE_WINDOW", 10*time.Minute),
+		TrustProxyHeaders:     getbool("TRUST_PROXY_HEADERS", false),
 		APIListen:             getenv("API_LISTEN", ":8080"),
 		APIAdminListen:        getenv("API_ADMIN_LISTEN", ":8443"),
 		APIMTLSCAFile:         getenv("API_MTLS_CA_FILE", ""),
@@ -223,9 +268,25 @@ func (c *Config) Validate() error {
 	}
 	if len(c.APIJWTSecret) < 32 {
 		errs = append(errs, "API_JWT_SECRET must be at least 32 chars (generate with: openssl rand -hex 32)")
+	} else if isPlaceholderSecret(c.APIJWTSecret) {
+		errs = append(errs, "API_JWT_SECRET must be a real random secret (placeholder detected; generate with: openssl rand -hex 32)")
+	}
+	if c.BootstrapToken != "" && (len(c.BootstrapToken) < 32 || isPlaceholderSecret(c.BootstrapToken)) {
+		errs = append(errs, "BOOTSTRAP_TOKEN must be a strong random token (>=32 chars) or empty (placeholder/short tokens are rejected)")
 	}
 	if c.ECSScopeMax < 0 || c.ECSScopeMax > 32 {
 		errs = append(errs, "ECS_SCOPE_MAX must be 0..32")
+	}
+	if c.ECSDeriveMask < 0 || c.ECSDeriveMask > 32 {
+		errs = append(errs, "ECS_DERIVE_MASK must be 0..32")
+	}
+	for _, l := range []struct{ name, addr string }{{"INT_LISTEN_UDP", c.IntListenUDP}, {"INT_LISTEN_TCP", c.IntListenTCP}} {
+		if l.addr == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(l.addr); err != nil {
+			errs = append(errs, l.name+" invalid: "+err.Error())
+		}
 	}
 	if c.RateLimitQPS <= 0 {
 		errs = append(errs, "RATE_LIMIT_QPS must be > 0")
@@ -317,4 +378,16 @@ func hostname() string {
 		return "unknown"
 	}
 	return h
+}
+
+// isPlaceholderSecret 识别示例/占位密钥（如 CHANGE_ME_*），防止未替换的默认
+// 密钥被运行时接受，进而导致令牌可伪造或 bootstrap 被抢占。
+func isPlaceholderSecret(s string) bool {
+	up := strings.ToUpper(strings.TrimSpace(s))
+	for _, p := range []string{"CHANGE_ME", "CHANGEME", "PLACEHOLDER", "YOUR_SECRET", "YOUR-", "EXAMPLE"} {
+		if strings.Contains(up, p) {
+			return true
+		}
+	}
+	return false
 }
