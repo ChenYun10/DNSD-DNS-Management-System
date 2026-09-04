@@ -131,7 +131,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/dns/simulate", a.chain(a.simulate, a.auth.authMiddleware))
 
 	// logs: query(租户可看自己) / audit(仅审计管理员 auditadmin)
-	mux.HandleFunc("GET /api/v1/logs/query", a.chain(a.queryLogs, a.auth.authMiddleware))
+	mux.HandleFunc("GET /api/v1/logs/query", a.chain(a.queryLogs, a.auth.authMiddleware, requireRole(model.RoleSysAdmin, model.RoleTenant)))
 	mux.HandleFunc("GET /api/v1/logs/audit", a.chain(a.queryAudit, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
 	mux.HandleFunc("GET /api/v1/logs/audit/verify", a.chain(a.verifyAuditChain, a.auth.authMiddleware, requireRole(model.RoleAuditAdmin)))
 

@@ -42,6 +42,13 @@ func CheckPassword(hash, pw string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
 }
 
+// DummyPasswordHash 用于登录接口“用户不存在”分支的等时 bcrypt 比较, 避免
+// 通过响应时间差异探测用户名是否存在(用户名枚举)。cost 与 HashPassword 一致。
+var DummyPasswordHash = func() string {
+	h, _ := HashPassword("dns-platform-enumeration-guard")
+	return h
+}()
+
 var userCols = "id, tenant_id, username, password_hash, role, email, failed_attempts, locked_until, last_login, must_change_pwd, pwd_changed_at, created_at"
 
 func scanUser(row *sql.Row) (*model.User, error) {
@@ -149,17 +156,21 @@ func (r *Repos) CheckPasswordHistory(ctx context.Context, userID, plainPassword 
 	return false, rows.Err()
 }
 
-// RevokeAllSessions 强制下线: 删除用户所有 refresh token(等保: 会话吊销)
+// RevokeAllSessions 强制下线: 删除用户所有 refresh token(等保: 会话吊销)。
+// 通过用户级索引精确删除(避免全库 SCAN), 并写入吊销时间戳使此前签发的
+// access token(iat < rev_ts)在 authMiddleware 立即失效。
 func (r *Repos) RevokeAllSessions(ctx context.Context, userID string, rdb *redis.Client) error {
-	// 通过 Redis 全量扫描 key 前缀 dns:refresh:* 删除该用户的令牌
-	iter := rdb.Scan(ctx, 0, "dns:refresh:*", 500).Iterator()
-	for iter.Next(ctx) {
-		key := iter.Val()
-		if v, err := rdb.Get(ctx, key).Result(); err == nil && v == userID {
-			rdb.Del(ctx, key)
+	indexKey := "dns:refresh:user:" + userID
+	members, err := rdb.SMembers(ctx, indexKey).Result()
+	if err == nil {
+		for _, jti := range members {
+			rdb.Del(ctx, "dns:refresh:"+jti)
 		}
+		rdb.Del(ctx, indexKey)
 	}
-	return iter.Err()
+	// 吊销时间戳(30 天 TTL, 覆盖 access token 生命周期并留足余量)
+	rdb.Set(ctx, "dns:user:rev:"+userID, time.Now().Unix(), 30*24*time.Hour)
+	return nil
 }
 
 // UpdateUser updates the tenant binding / role / email of a user.

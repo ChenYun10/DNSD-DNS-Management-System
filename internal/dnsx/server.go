@@ -94,12 +94,14 @@ func NewServer(cfg *config.Config, core *Core) (*Server, error) {
 				}
 				return s.tlsConf.Clone(), nil
 			}
-			// 2) platform base domain & subdomains (wildcard cert)
+			// 2) exact platform base domain (wildcard cert)
 			base := strings.ToLower(strings.TrimSuffix(cfg.BaseDomain, "."))
-			if host == base || strings.HasSuffix(host, "."+base) {
+			if host == base {
 				return s.tlsConf.Clone(), nil
 			}
-			// 3) tenant prefix routing (prefix.base_domain)
+			// 3) tenant prefix routing: 仅已注册且启用的前缀放行; 未知前缀在此
+			//    握手层拒绝, 修复此前“任意 *.base_domain 子域都放行”导致的前缀
+			//    隔离失效。
 			prefix := prefixFromSNI(host, cfg.BaseDomain)
 			if prefix == "" {
 				return nil, errors.New("unrecognized server name")

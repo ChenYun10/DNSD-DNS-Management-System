@@ -24,10 +24,14 @@ func (a *API) queryLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tenantID = c.TID // 强制租户隔离
-	case model.RoleAdmin, model.RoleSysAdmin, model.RoleSecAdmin, model.RoleAuditAdmin:
+	case model.RoleAdmin, model.RoleSysAdmin:
 		if tenantID == "" {
 			tenantID = c.TID // 管理员绑定租户时默认看自己租户(可显式传空看全部)
 		}
+	default:
+		// secadmin/auditadmin 无查询日志读取权限(三员分立), 防御纵深
+		writeErr(w, http.StatusForbidden, "insufficient role")
+		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))

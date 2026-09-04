@@ -22,7 +22,7 @@ func (a *API) scopeTenant(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		id := r.PathValue("id")
-		if c.Role != string(model.RoleAdmin) && c.TID != id {
+		if !isPlatformAdmin(c.Role) && c.TID != id {
 			writeErr(w, http.StatusForbidden, "not your tenant")
 			return
 		}
@@ -109,7 +109,7 @@ func (a *API) updateTenant(w http.ResponseWriter, r *http.Request) {
 	// tenant users may only toggle their own protocol flags; prefix changes
 	// go through /dot (audited separately)
 	c := claimsFrom(r)
-	isSysAdmin := c.Role == string(model.RoleAdmin) || c.Role == string(model.RoleSysAdmin)
+	isSysAdmin := isPlatformAdmin(c.Role)
 	if !isSysAdmin {
 		t.DoTEnabled = in.DoTEnabled
 		t.DoHEnabled = in.DoHEnabled

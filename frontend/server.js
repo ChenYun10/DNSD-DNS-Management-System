@@ -15,9 +15,18 @@ const MIME = {
 };
 
 http.createServer((req, res) => {
-  const urlPath = decodeURIComponent(req.url.split('?')[0]);
-  let file = path.normalize(path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath));
-  if (!file.startsWith(ROOT)) { res.writeHead(403).end('forbidden'); return; }
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(req.url.split('?')[0]);
+  } catch (e) {
+    res.writeHead(400).end('bad request');
+    return;
+  }
+  const file = path.resolve(ROOT, urlPath === '/' ? 'index.html' : urlPath);
+  if (file !== ROOT && !file.startsWith(ROOT + path.sep)) {
+    res.writeHead(403).end('forbidden');
+    return;
+  }
 
   fs.readFile(file, (err, data) => {
     if (err) {

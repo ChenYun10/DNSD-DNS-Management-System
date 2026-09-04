@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net"
 	"net/http"
 	"strings"
 
@@ -48,7 +49,7 @@ func (a *API) simulate(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" {
 		tenantID = c.TID
 	}
-	if c.Role != string(model.RoleAdmin) && c.TID != tenantID {
+	if !isPlatformAdmin(c.Role) && c.TID != tenantID {
 		writeErr(w, http.StatusForbidden, "not your tenant")
 		return
 	}
@@ -88,11 +89,11 @@ func (a *API) simulate(w http.ResponseWriter, r *http.Request) {
 	req.SetQuestion(dns.Fqdn(qname), dns.StringToType[qtype])
 	req.SetEdns0(1232, true) // DO bit on: DNSSEC data requested
 	meta := &dnsx.RequestMeta{
-		Via:           "simulate",
-		Tenant:        tenant,
-		ClientIP:      nil,
-		SimulateECS:   ecs,
-		SkipRateLimit: true,
+		Via:         "simulate",
+		Tenant:      tenant,
+		ClientIP:    net.ParseIP(clientIP(r)),
+		SimulateECS: ecs,
+		// 不再 SkipRateLimit: 模拟请求同样受租户×客户端IP限流约束, 防止滥用
 	}
 	resp, rm := a.core.Process(r.Context(), req, meta)
 

@@ -50,6 +50,7 @@ type Auth struct {
 type Claims struct {
 	Role  string `json:"role"`
 	TID   string `json:"tid,omitempty"`
+	Use   string `json:"use,omitempty"`   // access | refresh：区分 token 类型，防类型混淆
 	Scope string `json:"scope,omitempty"` // 受限 token 的用途(如 change-password)
 	jwt.RegisteredClaims
 }
@@ -90,6 +91,8 @@ func (a *Auth) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u == nil {
+		// 等时: 对不存在的用户也执行一次 bcrypt 比较, 避免登录响应时间泄露用户名是否存在
+		_ = store.CheckPassword(store.DummyPasswordHash, req.Password)
 		writeErr(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -153,6 +156,11 @@ func (a *Auth) refresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid refresh token")
 		return
 	}
+	// token 类型校验: 仅 refresh token 可用于续签
+	if claims.Use != "refresh" {
+		writeErr(w, http.StatusUnauthorized, "invalid refresh token")
+		return
+	}
 	// single-use: consume the stored jti
 	key := "dns:refresh:" + claims.ID
 	uid, err := a.rdb.GetDel(r.Context(), key).Result()
@@ -212,6 +220,7 @@ func (a *Auth) issuePair(ctx context.Context, u *model.User) (*tokenPair, error)
 	access := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
 		Role: string(u.Role),
 		TID:  u.TenantID,
+		Use:  "access",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   u.ID,
 			ID:        accessJTI,
@@ -227,6 +236,7 @@ func (a *Auth) issuePair(ctx context.Context, u *model.User) (*tokenPair, error)
 	refresh := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
 		Role: string(u.Role),
 		TID:  u.TenantID,
+		Use:  "refresh",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   u.ID,
 			ID:        refreshJTI,
@@ -239,10 +249,14 @@ func (a *Auth) issuePair(ctx context.Context, u *model.User) (*tokenPair, error)
 	if err != nil {
 		return nil, err
 	}
-	// persist refresh token (single-use) in Redis
+	// persist refresh token (single-use) in Redis, 并维护用户级索引便于批量吊销
 	if err := a.rdb.Set(ctx, "dns:refresh:"+refreshJTI, u.ID, a.cfg.JWTRefreshExp).Err(); err != nil {
 		return nil, err
 	}
+	if err := a.rdb.SAdd(ctx, "dns:refresh:user:"+u.ID, refreshJTI).Err(); err != nil {
+		return nil, err
+	}
+	_ = a.rdb.Expire(ctx, "dns:refresh:user:"+u.ID, a.cfg.JWTRefreshExp)
 	return &tokenPair{
 		AccessToken:  at,
 		RefreshToken: rt,
@@ -258,6 +272,7 @@ func (a *Auth) issueRestrictedPair(ctx context.Context, u *model.User, scope str
 	access := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
 		Role:  string(u.Role),
 		TID:   u.TenantID,
+		Use:   "access",
 		Scope: scope,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   u.ID,
@@ -289,10 +304,11 @@ func (a *Auth) parse(token string, refresh bool) (*Claims, error) {
 	if err != nil || !tok.Valid {
 		return nil, errors.New("invalid token")
 	}
-	// enforce token kind by claim presence: refresh tokens carry a stored jti
+	// refresh token 必须仍在 Redis 活跃(未被消费/吊销)。注意 Exists 返回的是
+	// (count, err)，key 不存在时 count==0 且 err==nil，不能用 redis.Nil 判断。
 	if refresh {
-		_, err := a.rdb.Exists(context.Background(), "dns:refresh:"+claims.ID).Result()
-		if err != nil || err == redis.Nil {
+		n, err := a.rdb.Exists(context.Background(), "dns:refresh:"+claims.ID).Result()
+		if err != nil || n == 0 {
 			return nil, errors.New("refresh token not active")
 		}
 	}
@@ -313,10 +329,23 @@ func (a *Auth) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
+		// token 类型校验: 仅 access token 可用于接口访问; refresh token 拒绝
+		// (修复: refresh token 被当作 access token 使用导致的会话吊销失效)
+		if claims.Use != "access" {
+			writeErr(w, http.StatusUnauthorized, "invalid token type")
+			return
+		}
 		// blacklist check
 		if n, _ := a.rdb.Exists(r.Context(), "dns:jwt:blacklist:"+claims.ID).Result(); n > 0 {
 			writeErr(w, http.StatusUnauthorized, "token revoked")
 			return
+		}
+		// 用户级吊销时间戳: 登出/强制下线/改密后, 此前签发的 access token 全部失效
+		if revTs, err := a.rdb.Get(r.Context(), "dns:user:rev:"+claims.Subject).Int64(); err == nil && revTs > 0 {
+			if claims.IssuedAt != nil && claims.IssuedAt.Unix() < revTs {
+				writeErr(w, http.StatusUnauthorized, "token revoked")
+				return
+			}
 		}
 		// 受限 token(scope)只能访问对应端点(等保: 强制改密流程的最小权限)
 		if claims.Scope != "" && r.URL.Path != "/api/v1/auth/change-password" {
@@ -352,6 +381,12 @@ func requireRole(roles ...model.Role) func(http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 		}
 	}
+}
+
+// isPlatformAdmin 判定是否为平台管理员(旧 admin 与 sysadmin 均视为平台管理员)。
+// 统一所有“是否管理员”判断的口径, 避免 admin/sysadmin 不一致导致的权限错配。
+func isPlatformAdmin(role string) bool {
+	return role == string(model.RoleAdmin) || role == string(model.RoleSysAdmin)
 }
 
 type ctxClaims struct{}

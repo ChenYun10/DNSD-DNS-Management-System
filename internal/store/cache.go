@@ -207,12 +207,15 @@ func ECSActiveSetKey(tenantID string) string { return "dns:ecs:" + Safe(tenantID
 
 // Safe sanitizes a value for use inside a Redis key: it keeps only
 // [a-zA-Z0-9._/-] and caps length, which prevents key injection through
-// crafted qnames/ECSs.
+// crafted qnames/ECSs. 其余字符做十六进制转义(%XX)而非直接丢弃, 既防止 Redis
+// key/通配符注入, 又避免不同输入被清洗成同一 key(缓存碰撞/投毒)。
 func Safe(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' || r == '/' {
 			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, "%%%X", r)
 		}
 		if b.Len() >= 120 {
 			break
