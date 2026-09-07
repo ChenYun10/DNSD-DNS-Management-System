@@ -307,6 +307,61 @@ func (a *API) statsUpstreams(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// statsUsage 返回「公开免费用户 / VIP 用户」的使用人数统计（控制面板总览）。
+// 使用人数 = 时间窗内去重后的客户端 IP 数（一台设备/一个人对应一个来源 IP）。
+// 支持 ?window= 指定时间窗（Go duration 格式，如 24h/7d），默认 24h。
+func (a *API) statsUsage(w http.ResponseWriter, r *http.Request) {
+	window := 24 * time.Hour
+	if v := r.URL.Query().Get("window"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= 90*24*time.Hour {
+			window = d
+		}
+	}
+	since := time.Now().Add(-window)
+	rows, err := a.mysql.UsageByTenant(r.Context(), since)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var freeUsers, vipUsers, freeQueries, vipQueries int64
+	freeTenants, vipTenants := 0, 0
+	tenants := make([]map[string]any, 0, len(rows))
+	for _, u := range rows {
+		if u.VIP {
+			vipUsers += u.Users
+			vipQueries += u.Queries
+			vipTenants++
+		} else {
+			freeUsers += u.Users
+			freeQueries += u.Queries
+			freeTenants++
+		}
+		tenants = append(tenants, map[string]any{
+			"tenant_id":   u.TenantID,
+			"name":        u.Name,
+			"prefix":      u.Prefix,
+			"base_domain": u.BaseDomain,
+			"vip":         u.VIP,
+			"users":       u.Users,
+			"queries":     u.Queries,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window_hours": int(window.Hours()),
+		"since":        since.Format("2006-01-02 15:04:05"),
+		"free_users":   freeUsers,
+		"vip_users":    vipUsers,
+		"total_users":  freeUsers + vipUsers,
+		"free_tenants": freeTenants,
+		"vip_tenants":  vipTenants,
+		"free_queries": freeQueries,
+		"vip_queries":  vipQueries,
+		"tenants":      tenants,
+	})
+}
+
 func round2(f float64) float64 {
 	return float64(int(f*100)) / 100
 }

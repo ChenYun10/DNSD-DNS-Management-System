@@ -138,6 +138,7 @@ func (a *API) Handler() http.Handler {
 	// stats
 	mux.HandleFunc("GET /api/v1/stats/overview", a.chain(a.statsOverview, a.auth.authMiddleware))
 	mux.HandleFunc("GET /api/v1/stats/upstreams", a.chain(a.statsUpstreams, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
+	mux.HandleFunc("GET /api/v1/stats/usage", a.chain(a.statsUsage, a.auth.authMiddleware, requireRole(model.RoleSysAdmin)))
 
 	return a.middleware(mux)
 }

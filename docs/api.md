@@ -83,6 +83,7 @@ Base URL：`http://<host>:8080`（管理通道 `:8443`，可选 mTLS）
 |---|---|---|---|
 | GET | `/api/v1/stats/overview` | 任意 | QPS/命中率/错误率/累计 |
 | GET | `/api/v1/stats/upstreams` | admin | 上游查询分布 + 健康状态 |
+| GET | `/api/v1/stats/usage` | admin | 公开免费/VIP 使用人数统计（`?window=24h` 可调时间窗，默认 24h；按去重客户端 IP 计） |
 
 ## 热域名（admin）
 

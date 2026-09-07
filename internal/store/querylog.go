@@ -263,6 +263,53 @@ func (s *MySQLStore) QueryLogs(ctx context.Context, tenantID, qname, qtype, from
 	return out, total, rows.Err()
 }
 
+// TenantUsage is a per-tenant usage summary: how many distinct clients
+// (distinct client_ip — a proxy for the number of people/devices in use)
+// and how many queries each tenant produced over a time window.
+type TenantUsage struct {
+	TenantID   string `json:"tenant_id"`
+	Name       string `json:"name"`
+	Prefix     string `json:"prefix"`
+	BaseDomain string `json:"base_domain"`
+	VIP        bool   `json:"vip"`
+	Users      int64  `json:"users"`   // 去重客户端 IP 数（使用人数）
+	Queries    int64  `json:"queries"` // 查询总量
+}
+
+// UsageByTenant 统计时间窗内每个租户的使用人数（去重客户端 IP）与查询量，
+// 供控制面板区分「公开免费用户 / VIP 用户」。仅统计归属某个租户的查询
+// （tenant_id 为空的行不属于任何客户工作区，跳过）。
+func (s *MySQLStore) UsageByTenant(ctx context.Context, since time.Time) ([]TenantUsage, error) {
+	q := `SELECT ql.tenant_id,
+		       MAX(COALESCE(t.name, ''))         AS name,
+		       MAX(COALESCE(t.prefix, ''))       AS prefix,
+		       MAX(COALESCE(t.base_domain, ''))  AS base_domain,
+		       MAX(COALESCE(t.vip, ql.vip))      AS vip,
+		       COUNT(DISTINCT ql.client_ip)      AS users,
+		       COUNT(*)                          AS queries
+		FROM query_logs ql
+		LEFT JOIN tenants t ON t.id = ql.tenant_id
+		WHERE ql.ts >= ? AND ql.tenant_id IS NOT NULL AND ql.tenant_id <> ''
+		GROUP BY ql.tenant_id
+		ORDER BY users DESC`
+	rows, err := s.db.QueryContext(ctx, q, since.Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TenantUsage
+	for rows.Next() {
+		var u TenantUsage
+		var vip int64
+		if err := rows.Scan(&u.TenantID, &u.Name, &u.Prefix, &u.BaseDomain, &vip, &u.Users, &u.Queries); err != nil {
+			return nil, err
+		}
+		u.VIP = vip != 0
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // QueryAudit returns recent audit log rows (admin channel).
 func (s *MySQLStore) QueryAudit(ctx context.Context, action string, limit int) ([]model.AuditRow, error) {
 	if limit <= 0 || limit > 500 {

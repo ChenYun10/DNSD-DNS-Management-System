@@ -27,6 +27,36 @@ Views.dashboard = {
     grid.appendChild(statCard('累计查询', fmtNum(tq), '自实例启动以来'));
     host.appendChild(grid);
 
+    // 使用人数统计（平台管理员可见）：公开免费用户 vs VIP 用户
+    const isAdmin = me && me.user && (me.user.role === 'admin' || me.user.role === 'sysadmin');
+    if (isAdmin) {
+      const usage = await get('/api/v1/stats/usage').catch(() => null);
+      if (usage) {
+        host.appendChild(el('div', { class: 'section-title' }, '用户使用统计'));
+        host.appendChild(el('div', { class: 'section-sub' },
+          '公开免费用户 / VIP 用户使用人数（近 ' + usage.window_hours + ' 小时，按去重客户端 IP 计）'));
+
+        const ugrid = el('div', { class: 'grid grid-4' });
+        ugrid.appendChild(statCard('免费用户人数', fmtNum(usage.free_users), usage.free_tenants + ' 个免费租户'));
+        ugrid.appendChild(statCard('VIP 用户人数', fmtNum(usage.vip_users), usage.vip_tenants + ' 个 VIP 租户'));
+        ugrid.appendChild(statCard('总使用人数', fmtNum(usage.total_users), '免费 + VIP'));
+        ugrid.appendChild(statCard('查询量', fmtNum(usage.free_queries + usage.vip_queries), '免费 ' + fmtNum(usage.free_queries) + ' · VIP ' + fmtNum(usage.vip_queries)));
+        host.appendChild(ugrid);
+
+        const tbl = el('div', { class: 'card' });
+        tbl.appendChild(el('h3', {}, '各租户使用人数明细'));
+        tbl.insertAdjacentHTML('beforeend', table(
+          [{ t: '租户', f: r => '<b>' + esc(r.name || '（未命名）') + '</b>' },
+           { t: '接入域名', f: r => '<span class="mono">' + esc((r.prefix ? r.prefix + '.' : '') + r.base_domain) + '</span>' },
+           { t: '通道', f: r => r.vip ? badgeVip('VIP') : badgeInfo('免费') },
+           { t: '使用人数', f: r => fmtNum(r.users) },
+           { t: '查询量', f: r => fmtNum(r.queries) }],
+          usage.tenants || [], '暂无使用数据'
+        ));
+        host.appendChild(tbl);
+      }
+    }
+
     if (vip) {
       host.appendChild(el('div', { class: 'card vip-note' },
         '<h3>👑 高价值专用通道已启用</h3><div class="help">您的租户启用了 <b>VIP 专用通道</b>：专属上游组、' +
