@@ -25,6 +25,7 @@ server {
     }
 
     # API 反代：前端只发 /api 相对请求，这里转发到内网 apid，后端地址对客户端不可见
+    # 前提：apid 设 API_LISTEN=127.0.0.1:8080 仅监听回环（.env.example 默认），不暴露公网
     location /api/ {
         proxy_pass http://127.0.0.1:8080;      # ← apid 内网地址，此处是唯一出现后端地址的地方
         proxy_http_version 1.1;
