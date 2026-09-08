@@ -19,6 +19,50 @@
       <StatCard label="本租户查询" :value="fmtNum(overview.tenant_queries ?? overview.total_queries)" />
     </div>
 
+    <!-- 活跃客户端 -->
+    <div class="card p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 class="text-[14px] font-semibold">活跃客户端</h2>
+          <p class="mt-0.5 text-[12px] text-ink-dim">正在使用本 DNS 服务的客户端（按源 IP 聚合最近查询）</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[12px] text-accent">
+            <span class="h-2 w-2 rounded-full bg-accent"></span>
+            使用中 {{ activeCount }}
+          </span>
+          <span class="rounded-full border border-line bg-surface-2 px-2.5 py-1 text-[12px] text-ink-dim">共 {{ activeClients.length }}</span>
+        </div>
+      </div>
+
+      <div v-if="activeClients.length" class="mt-4 overflow-x-auto">
+        <table class="w-full text-left text-[12.5px]">
+          <thead class="border-b border-line text-ink-faint">
+            <tr>
+              <th class="py-2 pr-4 font-medium">状态</th>
+              <th class="py-2 pr-4 font-medium">客户端 IP</th>
+              <th class="py-2 pr-4 font-medium">查询次数</th>
+              <th class="py-2 font-medium">最后活跃</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in activeClients" :key="c.ip" class="border-b border-line-soft last:border-0">
+              <td class="py-2 pr-4">
+                <span class="inline-flex items-center gap-1.5">
+                  <span class="h-2 w-2 rounded-full" :class="c.online ? 'bg-accent' : 'bg-ink-faint'"></span>
+                  <span :class="c.online ? 'text-accent' : 'text-ink-faint'">{{ c.online ? '使用中' : '离线' }}</span>
+                </span>
+              </td>
+              <td class="mono py-2 pr-4 text-ink">{{ c.ip }}</td>
+              <td class="py-2 pr-4 tabular-nums text-ink">{{ fmtNum(c.count) }}</td>
+              <td class="py-2 text-ink-dim">{{ fmtAgo(c.last) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else class="mt-3 text-[12.5px] text-ink-faint">暂无客户端查询记录</div>
+    </div>
+
     <!-- 图表区 -->
     <div class="grid gap-4 lg:grid-cols-2">
       <div class="card p-5">
@@ -124,7 +168,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api/endpoints'
 import { session } from '../store/session'
-import { fmtNum, fmtPct, fmtRtt, shortTs } from '../utils/format'
+import { fmtNum, fmtPct, fmtRtt, shortTs, fmtAgo } from '../utils/format'
 import StatCard from '../components/StatCard.vue'
 import LineChart from '../components/LineChart.vue'
 import BarChart from '../components/BarChart.vue'
@@ -190,6 +234,26 @@ const upstreamDist = computed(() => {
   }
   return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([label, value]) => ({ label, value }))
 })
+
+// 活跃客户端：按 client_ip 聚合最近查询，"正在使用"= 最后活跃在 5 分钟内
+const ACTIVE_WINDOW_MS = 5 * 60 * 1000
+const activeClients = computed(() => {
+  const now = Date.now()
+  const m = new Map()
+  for (const r of logs.value) {
+    const ip = r.client_ip || '(未知)'
+    const ts = new Date(r.ts).getTime()
+    const e = m.get(ip) || { ip, count: 0, last: 0 }
+    e.count++
+    if (ts > e.last) e.last = ts
+    m.set(ip, e)
+  }
+  return [...m.values()]
+    .sort((a, b) => b.last - a.last)
+    .map((e) => ({ ...e, online: now - e.last < ACTIVE_WINDOW_MS }))
+})
+
+const activeCount = computed(() => activeClients.value.filter((c) => c.online).length)
 
 function rcodeColor(rcode) {
   const c = { NOERROR: 'text-accent', NXDOMAIN: 'text-warn', SERVFAIL: 'text-danger' }

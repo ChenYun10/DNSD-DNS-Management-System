@@ -62,3 +62,16 @@ export function rcodeLabel(rcode) {
   }
   return map[rcode] || rcode || '—'
 }
+
+// 相对时间（用于"最后活跃 X 分钟前"）
+export function fmtAgo(ts) {
+  if (!ts) return '—'
+  const t = new Date(ts).getTime()
+  if (Number.isNaN(t)) return '—'
+  let diff = Date.now() - t
+  if (diff < 0) diff = 0
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return Math.floor(diff / 60_000) + ' 分钟前'
+  if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + ' 小时前'
+  return Math.floor(diff / 86_400_000) + ' 天前'
+}
