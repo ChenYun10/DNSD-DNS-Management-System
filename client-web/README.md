@@ -48,6 +48,22 @@ npm run build          # 产出 dist/
 npm run preview        # 本地预览 dist
 ```
 
+## 渲染自检（无需真实后端）
+
+`scripts/render-check.mjs` 用 playwright 启动真实浏览器，拦截 `/api` 请求返回 mock 数据，验证登录页 + Setup/Analytics/Logs/Settings 五个页面的真实渲染，并截图。
+
+```bash
+# 首次需装浏览器（playwright chromium）
+npx playwright install chromium
+
+# 另开一个终端跑 dev server，再执行自检
+npm run dev
+npm run render-check              # 默认 http://localhost:8082
+npm run render-check -- http://localhost:9000 /tmp/shots   # 自定义 baseUrl 与截图目录
+```
+
+全部通过输出 `N/N 通过` 且退出码为 0；任一失败退出码为 1。截图默认存到系统临时目录 `dnsd-render-check/`。
+
 ## 与 apid 对接（端点隐藏）
 
 前端**不暴露后端地址/端点**：所有请求走同源相对路径 `/api`，后端 apid 的真实地址与端口只出现在反向代理配置中，客户端永远看不到。

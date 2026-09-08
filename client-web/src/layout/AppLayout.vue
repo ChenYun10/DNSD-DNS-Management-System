@@ -159,7 +159,17 @@ async function onLogout() {
   router.push('/login')
 }
 
-onMounted(() => {
+onMounted(async () => {
   collapsed.value = window.innerWidth >= 768
+  // 整页刷新后 user/tenant 内存丢失但 token 仍在：自动恢复 profile
+  if (session.isAuthed() && !session.user) {
+    try {
+      const me = await auth.me()
+      session.setProfile(me.user, me.tenant || null)
+    } catch {
+      session.clear()
+      router.push('/login')
+    }
+  }
 })
 </script>
