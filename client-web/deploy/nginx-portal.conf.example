@@ -1,0 +1,41 @@
+# DNSD 客户端门户 生产部署示例
+# 关键：客户端只接触公开域名 portal.example.com，后端 apid 的真实地址/端口对内隐藏。
+# apid 应仅监听内网（127.0.0.1 或内网网卡），不要暴露公网端口。
+
+server {
+    listen 443 ssl http2;
+    server_name portal.example.com;   # 客户端门户公开域名
+
+    ssl_certificate     /etc/ssl/portal.example.com/fullchain.pem;
+    ssl_certificate_key /etc/ssl/portal.example.com/privkey.pem;
+
+    # 前端静态资源（npm run build 产出）
+    root /var/www/dnsd-client-web/dist;
+    index index.html;
+
+    # SPA 路由回退（/setup /analytics /logs /settings 由前端路由接管）
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 带指纹的静态资源长缓存
+    location /assets/ {
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # API 反代：前端只发 /api 相对请求，这里转发到内网 apid，后端地址对客户端不可见
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;      # ← apid 内网地址，此处是唯一出现后端地址的地方
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        # apid 限流/审计依赖真实客户端 IP：需在 apid .env 开启 TRUST_PROXY_HEADERS=true
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}
+
+# 如需纯 HTTP（开发/内网），可另加 80 端口跳转 443：
+# server { listen 80; server_name portal.example.com; return 301 https://$host$request_uri; }

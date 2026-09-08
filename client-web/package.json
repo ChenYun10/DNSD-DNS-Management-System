@@ -1,0 +1,22 @@
+{
+  "name": "dnsd-client-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DNSD 客户端门户（租户自助）：NextDNS 风格暗色 UI",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "tailwindcss": "^4.1.11",
+    "vite": "^6.4.3"
+  }
+}
