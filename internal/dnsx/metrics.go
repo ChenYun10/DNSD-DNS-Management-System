@@ -21,10 +21,11 @@ type Stats struct {
 	totalHit    atomic.Uint64
 	totalErr    atomic.Uint64
 	totalThreat atomic.Uint64
+	totalBlock  atomic.Uint64
 }
 
 type bucket struct {
-	q, hit, miss, err, threat uint64
+	q, hit, miss, err, threat, block uint64
 }
 
 func NewStats() *Stats { return &Stats{started: time.Now()} }
@@ -34,6 +35,7 @@ func (s *Stats) IncHit()   { s.bump(func(b *bucket) { b.hit++ }); s.totalHit.Add
 func (s *Stats) IncMiss()  { s.bump(func(b *bucket) { b.miss++ }) }
 func (s *Stats) IncError()  { s.bump(func(b *bucket) { b.err++ }); s.totalErr.Add(1) }
 func (s *Stats) IncThreat() { s.bump(func(b *bucket) { b.threat++ }); s.totalThreat.Add(1) }
+func (s *Stats) IncBlock()  { s.bump(func(b *bucket) { b.block++ }); s.totalBlock.Add(1) }
 
 func (s *Stats) bump(f func(*bucket)) {
 	now := time.Now()
@@ -71,6 +73,9 @@ func (s *Stats) Totals() (q, hit, err uint64) {
 
 // TotalThreats returns the cumulative count of detected malicious domains.
 func (s *Stats) TotalThreats() uint64 { return s.totalThreat.Load() }
+
+// TotalBlocks returns the cumulative count of blocked (sinkholed) queries.
+func (s *Stats) TotalBlocks() uint64 { return s.totalBlock.Load() }
 
 // FlushToRedis writes the current snapshot + totals into a shared Redis key
 // so that the control plane (apid) can read cross-instance statistics.

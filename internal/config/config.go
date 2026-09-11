@@ -153,6 +153,8 @@ type Config struct {
 	ThreatBroadcastPort      int           // 广播 UDP 端口
 	ThreatWorkerCount        int           // 异步检查 worker 数
 	ThreatQueueSize          int           // 异步检查队列长度（满则丢弃，不阻塞解析）
+	ThreatBlockMode          string        // 拦截响应 IP 策略：off | 127.0.0.1 | random
+	ThreatBlockPool          string        // random 模式的 sinkhole IP 池，逗号分隔
 }
 
 // Load reads configuration from the environment. If path is non-empty and the
@@ -247,6 +249,8 @@ func Load(envFile string) (*Config, error) {
 		ThreatBroadcastPort:      getint("THREAT_BROADCAST_PORT", 9999),
 		ThreatWorkerCount:        getint("THREAT_WORKER_COUNT", 8),
 		ThreatQueueSize:          getint("THREAT_QUEUE_SIZE", 4096),
+		ThreatBlockMode:          getenv("THREAT_BLOCK_MODE", "off"),
+		ThreatBlockPool:          getenv("THREAT_BLOCK_IP_POOL", "127.0.0.1,0.0.0.0"),
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

@@ -332,6 +332,17 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 
 	qname := strings.ToLower(q.Name)
 
+	// 恶意域名拦截：同步短路，命中黑名单/已回填情报则直接返回 sinkhole IP。
+	if c.threat != nil {
+		if hit, ip := c.threat.Block(qname); hit != nil {
+			c.stats.IncBlock()
+			log.Printf("[threat] BLOCKED domain=%s client=%s -> %s source=%s", qname, ipStr, ip, hit.Source)
+			rm.RCode = "NOERROR"
+			c.logQuery(req, meta, tenantID, ecsKey, qname, rm, vip)
+			return c.blockResponse(req, q, ip), rm
+		}
+	}
+
 	// 恶意域名主动发现：异步投递检查，队列满则丢弃，绝不阻塞解析路径。
 	if c.threat != nil {
 		select {
@@ -417,6 +428,30 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 	}
 	c.logQuery(req, meta, tenantID, ecsKey, qname, rm, vip)
 	return m, rm
+}
+
+// blockResponse 构造拦截响应：A 返回 sinkhole IPv4，AAAA 返回 ::1，
+// 其他类型返回 NOERROR 空答案（阻断查询但不伪造记录）。
+func (c *Core) blockResponse(req *dns.Msg, q dns.Question, ip net.IP) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Authoritative = false
+	switch q.Qtype {
+	case dns.TypeA:
+		if ip4 := ip.To4(); ip4 != nil {
+			m.Answer = append(m.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   ip4,
+			})
+		}
+	case dns.TypeAAAA:
+		m.Answer = append(m.Answer, &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+			AAAA: net.ParseIP("::1"),
+		})
+	}
+	m.Compress = true
+	return m
 }
 
 // fetchAndCache is the cache-bypass path used by warmup: fetch from upstream

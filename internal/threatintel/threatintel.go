@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -46,6 +48,10 @@ type Client struct {
 	blacklist *blacklist
 	cacheTTL  time.Duration
 
+	blockMode string   // off | 127.0.0.1 | random
+	blockPool []net.IP // random 模式的 sinkhole IP 池
+	blocked   sync.Map // 已回填的恶意域名 -> 拦截时间（进程内有效）
+
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
 }
@@ -66,6 +72,12 @@ func NewClient(cfg *config.Config) *Client {
 	}
 	if cfg.ThreatIntelBlacklistFile != "" {
 		c.blacklist = loadBlacklist(cfg.ThreatIntelBlacklistFile)
+	}
+	c.blockMode = strings.ToLower(cfg.ThreatBlockMode)
+	for _, s := range strings.Split(cfg.ThreatBlockPool, ",") {
+		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+			c.blockPool = append(c.blockPool, ip)
+		}
 	}
 	return c
 }
@@ -102,7 +114,46 @@ func (c *Client) Check(ctx context.Context, domain string) *ThreatInfo {
 	c.cache[domain] = cacheEntry{hit: hit, seen: time.Now()}
 	c.mu.Unlock()
 
+	// 5. 命中则回填内存拦截表，后续查询同步短路
+	if hit != nil {
+		c.rememberBlocked(domain)
+	}
 	return hit
+}
+
+// Block 同步判断域名是否应被拦截。返回命中信息 + sinkhole IP；nil 表示放行。
+// 仅查询本地数据（黑名单 + 已回填情报），零网络 I/O，可安全放在解析主路径。
+func (c *Client) Block(domain string) (*ThreatInfo, net.IP) {
+	if c.blockMode == "" || c.blockMode == "off" {
+		return nil, nil
+	}
+	domain = normalize(domain)
+	if domain == "" {
+		return nil, nil
+	}
+	if c.blacklist != nil && c.blacklist.matches(domain) {
+		return &ThreatInfo{Domain: domain, Source: "blacklist", Category: "blocked", Severity: "high", DetectedAt: time.Now()}, c.sinkholeIP()
+	}
+	if _, ok := c.blocked.Load(domain); ok {
+		return &ThreatInfo{Domain: domain, Source: "api", Category: "blocked", Severity: "high", DetectedAt: time.Now()}, c.sinkholeIP()
+	}
+	return nil, nil
+}
+
+// sinkholeIP 返回拦截响应的 IP：random 模式从池中随机，否则固定 127.0.0.1。
+func (c *Client) sinkholeIP() net.IP {
+	if c.blockMode == "random" && len(c.blockPool) > 0 {
+		return c.blockPool[rand.Intn(len(c.blockPool))]
+	}
+	return net.IPv4(127, 0, 0, 1)
+}
+
+// rememberBlocked 将命中域名写入内存拦截表（进程内有效，重启后由情报中心重新回填）。
+func (c *Client) rememberBlocked(domain string) {
+	if c.blockMode == "" || c.blockMode == "off" {
+		return
+	}
+	c.blocked.Store(domain, time.Now())
 }
 
 // lookupAPI 查询本地威胁情报中心。任何错误都返回 nil（fail-open，不误伤）。
