@@ -138,6 +138,21 @@ type Config struct {
 	AliyunAccessKeyID     string        // for DNS-01 issuance on Aliyun-hosted domains
 	AliyunAccessKeySecret string
 	CertRenewBefore       time.Duration // renew when expiry is closer than this
+
+	// 恶意域名主动发现（威胁情报）：解析过程中异步查询本地情报中心，
+	// 命中恶意域名后记录日志、累计指标，并可主动向局域网广播告警。
+	// 全部默认关闭/空，现有部署不受影响。
+	ThreatIntelEnabled       bool          // 总开关
+	ThreatIntelURL           string        // 本地威胁情报中心查询接口（POST JSON），空=仅用本地黑名单
+	ThreatIntelToken         string        // 情报中心认证 token（可选，Bearer）
+	ThreatIntelBlacklistFile string        // 本地黑名单文件：每行一个域名（支持 *.example.com 通配）
+	ThreatIntelCacheTTL      time.Duration // 域名信誉查询结果缓存时长
+	ThreatIntelTimeout       time.Duration // 情报中心 API 查询超时
+	ThreatBroadcastEnabled   bool          // 命中后主动局域网广播
+	ThreatBroadcastAddr      string        // 广播地址，默认 255.255.255.255（全局广播）
+	ThreatBroadcastPort      int           // 广播 UDP 端口
+	ThreatWorkerCount        int           // 异步检查 worker 数
+	ThreatQueueSize          int           // 异步检查队列长度（满则丢弃，不阻塞解析）
 }
 
 // Load reads configuration from the environment. If path is non-empty and the
@@ -221,6 +236,17 @@ func Load(envFile string) (*Config, error) {
 		AliyunAccessKeyID:     getenv("ALIYUN_ACCESS_KEY_ID", ""),
 		AliyunAccessKeySecret: getenv("ALIYUN_ACCESS_KEY_SECRET", ""),
 		CertRenewBefore:       getdur("CERT_RENEW_BEFORE", 30*24*time.Hour),
+		ThreatIntelEnabled:       getbool("THREAT_INTEL_ENABLED", false),
+		ThreatIntelURL:           getenv("THREAT_INTEL_URL", ""),
+		ThreatIntelToken:         getenv("THREAT_INTEL_TOKEN", ""),
+		ThreatIntelBlacklistFile: getenv("THREAT_INTEL_BLACKLIST_FILE", ""),
+		ThreatIntelCacheTTL:      getdur("THREAT_INTEL_CACHE_TTL", 5*time.Minute),
+		ThreatIntelTimeout:       getdur("THREAT_INTEL_TIMEOUT", 500*time.Millisecond),
+		ThreatBroadcastEnabled:   getbool("THREAT_BROADCAST_ENABLED", false),
+		ThreatBroadcastAddr:      getenv("THREAT_BROADCAST_ADDR", "255.255.255.255"),
+		ThreatBroadcastPort:      getint("THREAT_BROADCAST_PORT", 9999),
+		ThreatWorkerCount:        getint("THREAT_WORKER_COUNT", 8),
+		ThreatQueueSize:          getint("THREAT_QUEUE_SIZE", 4096),
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

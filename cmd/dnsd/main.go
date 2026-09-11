@@ -164,6 +164,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	core.Close()
 	core.UpstreamManager().Close()
 	cache.Close()
 	mysql.Close()

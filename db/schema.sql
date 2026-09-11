@@ -254,3 +254,17 @@ WHERE NOT EXISTS (SELECT 1 FROM split_rules WHERE name = 'cn-suffix');
 INSERT INTO hot_domains (id, tenant_id, domain, weight, enabled)
 SELECT 'dddddddd-0000-0000-0000-000000000001', NULL, 'example.com', 10, 1
 WHERE NOT EXISTS (SELECT 1 FROM hot_domains WHERE domain = 'example.com');
+
+-- ============ 恶意域名主动发现（威胁情报命中记录） ============
+CREATE TABLE IF NOT EXISTS threat_hits (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  ts         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  domain     VARCHAR(255) NOT NULL COMMENT '命中的恶意域名',
+  client_ip  VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '发起查询的客户端 IP',
+  category   VARCHAR(32)  NOT NULL DEFAULT '' COMMENT '恶意分类 malware/phishing/c2/botnet',
+  severity   VARCHAR(16)  NOT NULL DEFAULT '' COMMENT '严重程度 low/medium/high/critical',
+  source     VARCHAR(16)  NOT NULL DEFAULT '' COMMENT '情报来源 api/blacklist',
+  PRIMARY KEY (id),
+  KEY idx_ts (ts),
+  KEY idx_domain (domain)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='威胁情报命中审计记录（等保）';

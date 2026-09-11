@@ -17,13 +17,14 @@ type Stats struct {
 	window   [60]bucket
 	cur      int
 	started  time.Time
-	totalQ   atomic.Uint64
-	totalHit atomic.Uint64
-	totalErr atomic.Uint64
+	totalQ      atomic.Uint64
+	totalHit    atomic.Uint64
+	totalErr    atomic.Uint64
+	totalThreat atomic.Uint64
 }
 
 type bucket struct {
-	q, hit, miss, err uint64
+	q, hit, miss, err, threat uint64
 }
 
 func NewStats() *Stats { return &Stats{started: time.Now()} }
@@ -31,7 +32,8 @@ func NewStats() *Stats { return &Stats{started: time.Now()} }
 func (s *Stats) IncQuery() { s.bump(func(b *bucket) { b.q++ }); s.totalQ.Add(1) }
 func (s *Stats) IncHit()   { s.bump(func(b *bucket) { b.hit++ }); s.totalHit.Add(1) }
 func (s *Stats) IncMiss()  { s.bump(func(b *bucket) { b.miss++ }) }
-func (s *Stats) IncError() { s.bump(func(b *bucket) { b.err++ }); s.totalErr.Add(1) }
+func (s *Stats) IncError()  { s.bump(func(b *bucket) { b.err++ }); s.totalErr.Add(1) }
+func (s *Stats) IncThreat() { s.bump(func(b *bucket) { b.threat++ }); s.totalThreat.Add(1) }
 
 func (s *Stats) bump(f func(*bucket)) {
 	now := time.Now()
@@ -66,6 +68,9 @@ func (s *Stats) Snapshot() (qps float64, hitRate float64, errRate float64) {
 func (s *Stats) Totals() (q, hit, err uint64) {
 	return s.totalQ.Load(), s.totalHit.Load(), s.totalErr.Load()
 }
+
+// TotalThreats returns the cumulative count of detected malicious domains.
+func (s *Stats) TotalThreats() uint64 { return s.totalThreat.Load() }
 
 // FlushToRedis writes the current snapshot + totals into a shared Redis key
 // so that the control plane (apid) can read cross-instance statistics.

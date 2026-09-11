@@ -13,6 +13,7 @@ import (
 	"dns-platform/internal/config"
 	"dns-platform/internal/model"
 	"dns-platform/internal/store"
+	"dns-platform/internal/threatintel"
 )
 
 // Core is the DNS request pipeline shared by all listeners
@@ -35,6 +36,10 @@ type Core struct {
 	stats    *Stats
 
 	dualstack *Dualstack // IPv6→IPv4 ECS 推导 + 归属地/运营商校验
+
+	threat     *threatintel.Client      // 恶意域名主动发现（可选，THREAT_INTEL_ENABLED）
+	broadcast  *threatintel.Broadcaster // 命中后局域网广播（可选）
+	threatCh   chan threatCheckReq      // 异步检查队列
 
 	byUpstream *CounterSet // upstream -> queries
 	byTenant   *CounterSet // tenant -> queries
@@ -92,6 +97,26 @@ func NewCore(cfg *config.Config, cacheDrv store.Cache, logger *store.QueryLogWri
 			}
 			c.fetchAndCache(ctx, tenant, req, ecs, nil, "adaptive-warm")
 		}()
+	}
+
+	// 恶意域名主动发现：异步 worker 池，命中后日志+指标+局域网广播。
+	// 全部默认关闭，仅当 THREAT_INTEL_ENABLED=true 时启用。
+	if cfg.ThreatIntelEnabled {
+		c.threat = threatintel.NewClient(cfg)
+		if cfg.ThreatBroadcastEnabled {
+			if bc, err := threatintel.NewBroadcaster(cfg.ThreatBroadcastAddr, cfg.ThreatBroadcastPort); err == nil {
+				c.broadcast = bc
+				log.Printf("[threat] lan broadcast enabled: %s:%d", cfg.ThreatBroadcastAddr, cfg.ThreatBroadcastPort)
+			} else {
+				log.Printf("[threat] lan broadcast init failed (disabled): %v", err)
+			}
+		}
+		c.threatCh = make(chan threatCheckReq, cfg.ThreatQueueSize)
+		for i := 0; i < cfg.ThreatWorkerCount; i++ {
+			go c.threatWorker()
+		}
+		log.Printf("[threat] malicious-domain discovery enabled: url=%q blacklist=%q workers=%d queue=%d",
+			cfg.ThreatIntelURL, cfg.ThreatIntelBlacklistFile, cfg.ThreatWorkerCount, cfg.ThreatQueueSize)
 	}
 	return c
 }
@@ -306,6 +331,15 @@ func (c *Core) Process(ctx context.Context, req *dns.Msg, meta *RequestMeta) (*d
 	}
 
 	qname := strings.ToLower(q.Name)
+
+	// 恶意域名主动发现：异步投递检查，队列满则丢弃，绝不阻塞解析路径。
+	if c.threat != nil {
+		select {
+		case c.threatCh <- threatCheckReq{domain: qname, clientIP: ipStr}:
+		default:
+		}
+	}
+
 	cacheKey := store.CacheKey(tenantID, ecsKey, qname, dns.TypeToString[q.Qtype])
 
 	// --- cache lookup ---
@@ -448,6 +482,38 @@ func (c *Core) logQuery(req *dns.Msg, meta *RequestMeta, tenantID, ecsKey, qname
 		VIP:         vip,
 		Via:         via,
 	})
+}
+
+// Close 释放威胁情报相关资源（优雅停机时调用）。
+func (c *Core) Close() {
+	if c.threatCh != nil {
+		close(c.threatCh)
+	}
+	if c.broadcast != nil {
+		c.broadcast.Close()
+	}
+}
+
+// threatCheckReq 是一条待异步检查的域名。
+type threatCheckReq struct {
+	domain   string
+	clientIP string
+}
+
+// threatWorker 从队列消费域名，命中恶意情报则记录日志、累计指标并广播。
+func (c *Core) threatWorker() {
+	for req := range c.threatCh {
+		hit := c.threat.Check(context.Background(), req.domain)
+		if hit == nil {
+			continue
+		}
+		c.stats.IncThreat()
+		if c.broadcast != nil {
+			_ = c.broadcast.Broadcast(hit, req.clientIP)
+		}
+		log.Printf("[threat] MALICIOUS domain=%s client=%s category=%s severity=%s source=%s",
+			hit.Domain, req.clientIP, hit.Category, hit.Severity, hit.Source)
+	}
 }
 
 // --- helpers ---
